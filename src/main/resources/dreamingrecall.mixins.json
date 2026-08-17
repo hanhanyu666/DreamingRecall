@@ -1,0 +1,25 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.hhy.dreamingrecall.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "BlockEntityMixin",
+    "ChunkMapAccessor",
+    "LevelChunkMixin",
+    "ServerCommonPacketListenerMixin"
+  ],
+  "client": [
+    "ClientPacketListenerAccessor",
+    "ClientPacketListenerMixin",
+    "EntityAccessor",
+    "ItemInHandRendererMixin",
+    "LivingEntityAccessor",
+    "MinecraftAccessor",
+    "ClientLevelMixin",
+    "WalkAnimationStateAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
