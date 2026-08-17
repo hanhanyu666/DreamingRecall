@@ -122,8 +122,8 @@ public final class SegmentCodec {
              OutputStream raw = Channels.newOutputStream(channel);
              DataOutputStream output = new DataOutputStream(raw)) {
             output.writeInt(ArchiveFormat.SEGMENT_MAGIC);
-            output.writeShort(ArchiveFormat.FORMAT_MAJOR);
-            output.writeShort(ArchiveFormat.FORMAT_MINOR);
+            output.writeShort(ArchiveFormat.SEGMENT_FORMAT_MAJOR);
+            output.writeShort(ArchiveFormat.SEGMENT_FORMAT_MINOR);
             output.writeByte(COMPRESSION_DEFLATE);
             output.writeLong(sequence);
             output.writeLong(start);
@@ -196,7 +196,7 @@ public final class SegmentCodec {
         }
         int major = input.readUnsignedShort();
         int minor = input.readUnsignedShort();
-        if (major != ArchiveFormat.FORMAT_MAJOR || minor > ArchiveFormat.FORMAT_MINOR) {
+        if (major != ArchiveFormat.SEGMENT_FORMAT_MAJOR || minor > ArchiveFormat.SEGMENT_FORMAT_MINOR) {
             throw new IOException("Unsupported segment format " + major + "." + minor);
         }
         int compression = input.readUnsignedByte();

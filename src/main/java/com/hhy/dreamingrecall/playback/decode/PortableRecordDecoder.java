@@ -55,6 +55,8 @@ public final class PortableRecordDecoder {
             case CLIENT_PLAYER_VISUAL_SAMPLE -> decodePlayerVisualSample(payload);
             case CHAT_DELIVERY -> decodeChat(payload);
             case GAME_SOUND -> decodeSound(payload);
+            case PACKET_FRAME, PLAYER_TELEMETRY, VISIBILITY_INTERVAL, TRACK_CHECKPOINT ->
+                    new DecodedPayload.Unknown(type.id(), payload);
             case EXTENSION_PAYLOAD -> new DecodedPayload.Extension(ExtensionFrameCodec.decode(payload));
         };
     }

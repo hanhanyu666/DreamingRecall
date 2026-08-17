@@ -26,6 +26,10 @@ public enum CoreRecordType {
     CLIENT_PLAYER_VISUAL_SAMPLE(52),
     CHAT_DELIVERY(60),
     GAME_SOUND(70),
+    PACKET_FRAME(80),
+    PLAYER_TELEMETRY(81),
+    VISIBILITY_INTERVAL(82),
+    TRACK_CHECKPOINT(83),
     EXTENSION_PAYLOAD(1000);
 
     private final int id;

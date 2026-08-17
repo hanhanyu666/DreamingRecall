@@ -1,5 +1,8 @@
 package com.hhy.dreamingrecall.archive;
 
+import com.hhy.dreamingrecall.archive.track.TrackCatalog;
+import com.hhy.dreamingrecall.archive.track.TrackCatalogCodec;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +27,9 @@ public final class ArchiveLayout {
         Files.createDirectories(archiveDirectory.resolve("content"));
         Files.createDirectories(archiveDirectory.resolve("attachments"));
         ArchiveManifestCodec.writeManifest(archiveDirectory, manifest);
+        if (manifest.formatMajor() >= 2) {
+            TrackCatalogCodec.write(archiveDirectory, TrackCatalog.standard());
+        }
         return archiveDirectory;
     }
 }

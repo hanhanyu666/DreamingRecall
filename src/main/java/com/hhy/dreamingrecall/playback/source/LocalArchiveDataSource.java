@@ -1,6 +1,7 @@
 package com.hhy.dreamingrecall.playback.source;
 
 import com.hhy.dreamingrecall.archive.ArchiveIndex;
+import com.hhy.dreamingrecall.archive.ArchiveFormat;
 import com.hhy.dreamingrecall.archive.ArchiveManifest;
 import com.hhy.dreamingrecall.archive.ArchiveManifestCodec;
 import com.hhy.dreamingrecall.archive.ArchiveScanResult;
@@ -48,6 +49,10 @@ public final class LocalArchiveDataSource implements ArchiveDataSource {
         Objects.requireNonNull(requiredMinecraftVersion, "requiredMinecraftVersion");
         Path normalized = archiveDirectory.toAbsolutePath().normalize();
         ArchiveManifest manifest = ArchiveManifestCodec.readManifest(normalized);
+        if (manifest.formatMajor() != ArchiveFormat.FORMAT_MAJOR
+                || manifest.formatMinor() > ArchiveFormat.FORMAT_MINOR) {
+            throw new IOException("Unsupported archive format " + manifest.formatMajor() + "." + manifest.formatMinor());
+        }
         if (!manifest.minecraftVersion().equals(requiredMinecraftVersion)) {
             throw new IOException(
                     "Archive Minecraft version " + manifest.minecraftVersion()
