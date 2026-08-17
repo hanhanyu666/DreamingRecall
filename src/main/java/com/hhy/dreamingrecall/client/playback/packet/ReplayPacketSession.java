@@ -37,14 +37,14 @@ final class ReplayPacketSession implements AutoCloseable {
     private PacketReplayViewController view;
     private boolean closed;
 
-    ReplayPacketSession(Minecraft minecraft, PacketReplayIndex index) throws IOException {
+    ReplayPacketSession(Minecraft minecraft, PacketReplayIndex.PlayerTrack track) throws IOException {
         this.minecraft = minecraft;
         if (minecraft.level != null || minecraft.player != null) {
             throw new IllegalStateException("Disconnect from the current world before opening a replay");
         }
         ConfigTracker.INSTANCE.loadDefaultServerConfigs();
         try {
-            protocol = ReplayProtocolBootstrap.build(minecraft, index.bootstrapFrames());
+            protocol = ReplayProtocolBootstrap.build(minecraft, track.bootstrapFrames());
         } catch (IOException | RuntimeException | Error failure) {
             ConfigTracker.INSTANCE.unloadConfigs(ModConfig.Type.SERVER);
             throw failure;
@@ -90,6 +90,16 @@ final class ReplayPacketSession implements AutoCloseable {
 
     void finishBatch() {
         refreshView();
+    }
+
+    void applyTelemetry(
+            com.hhy.dreamingrecall.playback.decode.DecodedPayload.PlayerVisualSample playerVisual,
+            com.hhy.dreamingrecall.playback.decode.DecodedPayload.CameraSample camera
+    ) {
+        refreshView();
+        if (view != null) {
+            view.applyTelemetry(playerVisual, camera);
+        }
     }
 
     private void refreshView() {

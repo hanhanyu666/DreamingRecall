@@ -1,9 +1,11 @@
 package com.hhy.dreamingrecall.client.playback.packet;
 
 import com.hhy.dreamingrecall.client.playback.ReplayViewController;
+import com.hhy.dreamingrecall.client.playback.ReplayEntityFactory;
 import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
 import com.hhy.dreamingrecall.client.playback.ReplayClock;
 import com.hhy.dreamingrecall.director.CameraPose;
+import com.hhy.dreamingrecall.playback.decode.DecodedPayload;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.client.Camera;
 import net.minecraft.client.CameraType;
@@ -37,6 +39,7 @@ public final class PacketReplayViewController implements ReplayViewController {
     private CameraPose freeCamera;
     private ReplayWorldController.CameraMode cameraMode = ReplayWorldController.CameraMode.FREE;
     private UUID attachedPlayer;
+    private DecodedPayload.CameraSample latestCamera;
     private boolean closed;
 
     PacketReplayViewController(Minecraft minecraft) {
@@ -91,6 +94,22 @@ public final class PacketReplayViewController implements ReplayViewController {
             createFreeCameraEntity();
             ReplayClock.activate(level);
         }
+        updateCameraEntity();
+    }
+
+    void applyTelemetry(
+            DecodedPayload.PlayerVisualSample playerVisual,
+            DecodedPayload.CameraSample camera
+    ) {
+        if (closed) {
+            return;
+        }
+        if (playerVisual != null
+                && minecraft.player != null
+                && minecraft.player.getUUID().equals(playerVisual.playerId())) {
+            ReplayEntityFactory.updateClientPlayer(minecraft.player, playerVisual.playerSample());
+        }
+        latestCamera = camera;
         updateCameraEntity();
     }
 
@@ -232,6 +251,19 @@ public final class PacketReplayViewController implements ReplayViewController {
         if (target == null) {
             return freeCamera;
         }
+        DecodedPayload.CameraSample camera = attachedCameraSample();
+        if (cameraMode == ReplayWorldController.CameraMode.FIRST_PERSON && camera != null) {
+            return new CameraPose(
+                    activeDimension(),
+                    camera.x(),
+                    camera.y(),
+                    camera.z(),
+                    camera.yaw(),
+                    camera.pitch(),
+                    camera.roll(),
+                    camera.fov()
+            );
+        }
         Vec3 eye = target.getEyePosition();
         return new CameraPose(
                 activeDimension(),
@@ -326,10 +358,27 @@ public final class PacketReplayViewController implements ReplayViewController {
             updateCameraEntity();
             return;
         }
+        DecodedPayload.CameraSample camera = attachedCameraSample();
+        if (cameraMode == ReplayWorldController.CameraMode.FIRST_PERSON && camera != null) {
+            target.setPos(camera.x(), camera.y() - target.getEyeHeight(), camera.z());
+            target.setYRot(camera.yaw());
+            target.setXRot(camera.pitch());
+            target.setYHeadRot(camera.yaw());
+            target.setOldPosAndRot();
+            minecraft.options.fov().set(Mth.clamp(Math.round(camera.fov()), 30, 110));
+        }
         minecraft.setCameraEntity(target);
         minecraft.options.setCameraType(cameraMode == ReplayWorldController.CameraMode.FIRST_PERSON
                 ? CameraType.FIRST_PERSON
                 : CameraType.THIRD_PERSON_BACK);
+    }
+
+    private DecodedPayload.CameraSample attachedCameraSample() {
+        return latestCamera != null
+                && attachedPlayer != null
+                && attachedPlayer.equals(latestCamera.playerId())
+                ? latestCamera
+                : null;
     }
 
     private Entity player(UUID playerId) {

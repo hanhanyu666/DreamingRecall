@@ -55,6 +55,7 @@ public final class RecordingPipeline {
     private final CompletableFuture<Path> ready = new CompletableFuture<>();
     private final CompletableFuture<Path> stopped = new CompletableFuture<>();
     private final Consumer<Throwable> failureListener;
+    private final Consumer<ReplayRecord> droppedEnhancementListener;
     private final Thread writerThread;
     private volatile Path archiveDirectory;
 
@@ -69,10 +70,25 @@ public final class RecordingPipeline {
             RecordingSettings settings,
             Consumer<Throwable> failureListener
     ) {
+        this(archiveRoot, manifest, settings, failureListener, ignored -> {
+        });
+    }
+
+    public RecordingPipeline(
+            Path archiveRoot,
+            ArchiveManifest manifest,
+            RecordingSettings settings,
+            Consumer<Throwable> failureListener,
+            Consumer<ReplayRecord> droppedEnhancementListener
+    ) {
         this.archiveRoot = Objects.requireNonNull(archiveRoot, "archiveRoot");
         this.manifest = Objects.requireNonNull(manifest, "manifest");
         this.settings = Objects.requireNonNull(settings, "settings");
         this.failureListener = Objects.requireNonNull(failureListener, "failureListener");
+        this.droppedEnhancementListener = Objects.requireNonNull(
+                droppedEnhancementListener,
+                "droppedEnhancementListener"
+        );
         this.queue = new ArrayBlockingQueue<>(settings.queueCapacity());
         this.writerThread = Thread.ofPlatform()
                 .name("DreamingRecall-ArchiveWriter-" + manifest.archiveId().toString().substring(0, 8))
@@ -137,6 +153,7 @@ public final class RecordingPipeline {
             if (queue.remove(candidate)) {
                 queuedBytes.addAndGet(-candidate.retainedBytes());
                 metrics.evictedEnhancement();
+                notifyEnhancementDropped(candidate.record());
             }
         }
     }
@@ -144,6 +161,7 @@ public final class RecordingPipeline {
     private OfferResult rejectForSize(ReplayRecord record) {
         if (record.priority() == RecordPriority.ENHANCEMENT) {
             metrics.droppedEnhancement();
+            notifyEnhancementDropped(record);
             return OfferResult.DROPPED_ENHANCEMENT;
         }
         synchronized (offerLock) {
@@ -154,6 +172,7 @@ public final class RecordingPipeline {
     private OfferResult rejectForCapacity(ReplayRecord record, long boundarySequence) {
         if (record.priority() == RecordPriority.ENHANCEMENT) {
             metrics.droppedEnhancement();
+            notifyEnhancementDropped(record);
             return OfferResult.DROPPED_ENHANCEMENT;
         }
         metrics.droppedCore();
@@ -163,6 +182,14 @@ public final class RecordingPipeline {
         return record.payloadSize() > settings.maxRecordBytes()
                 ? OfferResult.REJECTED_TOO_LARGE
                 : OfferResult.CORE_GAP_STARTED;
+    }
+
+    private void notifyEnhancementDropped(ReplayRecord record) {
+        try {
+            droppedEnhancementListener.accept(record);
+        } catch (Throwable failure) {
+            LOGGER.log(System.Logger.Level.WARNING, "Dropped-enhancement listener failed", failure);
+        }
     }
 
     public boolean requiresBaseline() {

@@ -28,7 +28,7 @@ import net.minecraft.world.phys.Vec3;
 import java.util.Locale;
 import java.util.Optional;
 
-final class ReplayEntityFactory {
+public final class ReplayEntityFactory {
     private ReplayEntityFactory() {
     }
 
@@ -113,10 +113,26 @@ final class ReplayEntityFactory {
         }
         state.animation().ifPresent(animation -> applyPlayerAnimation(
                 player,
-                state,
+                state.transform().pose(),
                 animation,
                 Minecraft.getInstance().getTimer().getGameTimeDeltaPartialTick(false)
         ));
+    }
+
+    public static void updateClientPlayer(
+            AbstractClientPlayer player,
+            DecodedPayload.ClientPlayerSample sample
+    ) {
+        applyTransform(player, sample.transform());
+        player.setYHeadRot(sample.headYaw());
+        player.yBodyRot = sample.bodyYaw();
+        syncLivingInterpolationState(player);
+        applyPlayerAnimation(
+                player,
+                sample.transform().pose(),
+                sample.animation(),
+                Minecraft.getInstance().getTimer().getGameTimeDeltaPartialTick(false)
+        );
     }
 
     static void preparePlayerAnimationForRender(
@@ -192,7 +208,7 @@ final class ReplayEntityFactory {
         proxy.setInvisible(true);
         state.animation().ifPresent(animation -> applyPlayerAnimation(
                 proxy,
-                state,
+                state.transform().pose(),
                 animation,
                 Minecraft.getInstance().getTimer().getGameTimeDeltaPartialTick(false)
         ));
@@ -221,7 +237,7 @@ final class ReplayEntityFactory {
 
     private static void applyPlayerAnimation(
             AbstractClientPlayer player,
-            DecodedPayload.PlayerState state,
+            String pose,
             DecodedPayload.PlayerAnimation animation,
             float partialTick
     ) {
@@ -249,7 +265,7 @@ final class ReplayEntityFactory {
         living.dreamingrecall$setSwimAmount(swimAmount);
         living.dreamingrecall$setFallFlyTicks(Math.max(0, animation.fallFlyingTicks()));
         boolean fallFlying = animation.fallFlyingTicks() > 0
-                || state.transform().pose().equalsIgnoreCase("fall_flying");
+                || pose.equalsIgnoreCase("fall_flying");
         ((EntityAccessor) player).dreamingrecall$setSharedFlag(7, fallFlying);
     }
 

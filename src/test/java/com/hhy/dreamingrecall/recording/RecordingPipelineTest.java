@@ -216,7 +216,8 @@ class RecordingPipelineTest {
                 Duration.ofSeconds(30),
                 Duration.ofMillis(50)
         );
-        RecordingPipeline pipeline = pipeline(constrained);
+        List<ReplayRecord> droppedEnhancements = new ArrayList<>();
+        RecordingPipeline pipeline = pipeline(constrained, droppedEnhancements::add);
         pipeline.start();
 
         byte[] optionalPayload = new byte[512];
@@ -241,6 +242,10 @@ class RecordingPipelineTest {
         assertEquals(OfferResult.ACCEPTED, coreResult);
         assertEquals(0, pipeline.metrics().droppedCoreRecords());
         assertTrue(pipeline.metrics().droppedEnhancementRecords() > 0);
+        assertEquals(
+                pipeline.metrics().droppedEnhancementRecords(),
+                (long) droppedEnhancements.size()
+        );
 
         pipeline.requestStop(2_000, 1_001);
         pipeline.stoppedFuture().get(10, TimeUnit.SECONDS);
@@ -363,13 +368,22 @@ class RecordingPipelineTest {
     }
 
     private RecordingPipeline pipeline(RecordingSettings settings) {
+        return pipeline(settings, ignored -> {
+        });
+    }
+
+    private RecordingPipeline pipeline(
+            RecordingSettings settings,
+            java.util.function.Consumer<ReplayRecord> droppedEnhancementListener
+    ) {
         return new RecordingPipeline(
                 temporaryDirectory,
                 ArchiveManifest.create("1.21.1", "test", ArchiveManifest.SourceKind.DEDICATED_SERVER),
                 settings,
                 failure -> {
                     throw new AssertionError(failure);
-                }
+                },
+                droppedEnhancementListener
         );
     }
 }

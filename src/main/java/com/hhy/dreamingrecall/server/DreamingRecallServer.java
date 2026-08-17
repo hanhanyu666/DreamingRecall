@@ -22,7 +22,11 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
 import com.hhy.dreamingrecall.network.CameraSamplePayload;
+import com.hhy.dreamingrecall.network.ClientPacketBatchPayload;
 import com.hhy.dreamingrecall.network.PlayerVisualSamplePayload;
+import com.hhy.dreamingrecall.network.RecordingControlPayload;
+import net.neoforged.neoforge.network.PacketDistributor;
+import net.neoforged.neoforge.network.registration.NetworkRegistry;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -84,9 +88,14 @@ public final class DreamingRecallServer {
             session.start();
             session.whenStopped(() -> {
                 if (server.isRunning()) {
-                    server.execute(() -> sessions.remove(server, session));
+                    server.execute(() -> {
+                        if (sessions.remove(server, session)) {
+                            broadcastRecordingControl(server, session, false);
+                        }
+                    });
                 }
             });
+            broadcastRecordingControl(server, session, true);
             announce(server, "message.dreamingrecall.recording_started");
             DreamingRecall.LOGGER.info("Started {} DreamingRecall recording for {}", mode, server.getWorldData().getLevelName());
             return StartResult.STARTED;
@@ -103,6 +112,7 @@ public final class DreamingRecallServer {
             return StopResult.NOT_RECORDING;
         }
         announce(server, "message.dreamingrecall.recording_stopping");
+        broadcastRecordingControl(server, session, false);
         session.requestStop();
         return StopResult.STOPPING;
     }
@@ -127,6 +137,7 @@ public final class DreamingRecallServer {
     public void serverStopping(MinecraftServer server) {
         ServerRecordingSession session = sessions.get(server);
         if (session != null) {
+            broadcastRecordingControl(server, session, false);
             session.requestStop();
         }
     }
@@ -226,6 +237,20 @@ public final class DreamingRecallServer {
         }
     }
 
+    public void clientPacketBatch(ServerPlayer player, ClientPacketBatchPayload batch) {
+        MinecraftServer server = player.getServer();
+        if (server != null) {
+            session(server).ifPresent(session -> session.clientPacketBatch(player, batch));
+        }
+    }
+
+    public void playerLoggedIn(ServerPlayer player) {
+        MinecraftServer server = player.getServer();
+        if (server != null) {
+            session(server).ifPresent(session -> sendRecordingControl(player, session, true));
+        }
+    }
+
     public ExtensionSubmissionResult submitExtension(
             MinecraftServer server,
             ReplayExtension extension,
@@ -262,6 +287,31 @@ public final class DreamingRecallServer {
 
     private Optional<ServerRecordingSession> session(MinecraftServer server) {
         return Optional.ofNullable(sessions.get(server));
+    }
+
+    private static void broadcastRecordingControl(
+            MinecraftServer server,
+            ServerRecordingSession session,
+            boolean active
+    ) {
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            sendRecordingControl(player, session, active);
+        }
+    }
+
+    private static void sendRecordingControl(
+            ServerPlayer player,
+            ServerRecordingSession session,
+            boolean active
+    ) {
+        if (!NetworkRegistry.hasChannel(player.connection, RecordingControlPayload.TYPE.id())) {
+            return;
+        }
+        PacketDistributor.sendToPlayer(player, new RecordingControlPayload(
+                session.recordingId(),
+                active,
+                active && DreamingRecallConfig.CLIENT_CAMERA_TRACKS_ALLOWED.get()
+        ));
     }
 
     private static void announce(MinecraftServer server, String translationKey) {

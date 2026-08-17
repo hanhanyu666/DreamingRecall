@@ -92,6 +92,12 @@ public final class ReplayTimelineScreen extends Screen {
     private boolean hudVisible = true;
     private boolean semanticFallbackStarting;
     private long semanticFallbackTarget = -1;
+    private ReplayStateIndex semanticIndex;
+    private boolean exactPlayback;
+    private UUID desiredAttachedPlayer;
+    private ReplayWorldController.CameraMode desiredCameraMode = ReplayWorldController.CameraMode.FREE;
+    private final java.util.LinkedHashMap<UUID, ReplayWorldController.PlayerTarget> knownPlayers =
+            new java.util.LinkedHashMap<>();
 
     public ReplayTimelineScreen(Screen parent, ClientArchiveEntry archive) {
         super(Component.translatable("screen.dreamingrecall.timeline.title"));
@@ -169,7 +175,7 @@ public final class ReplayTimelineScreen extends Screen {
                 .build());
         applyHudVisibility();
         updateButtons();
-        if (materializer == null && failure == null) {
+        if (source == null && failure == null) {
             openArchive();
         }
     }
@@ -187,7 +193,7 @@ public final class ReplayTimelineScreen extends Screen {
         long elapsed = Math.max(0, now - lastTickNanos);
         lastTickNanos = now;
         if (!playing || scrubbing || index == null) {
-            if (packetController != null && minecraft.level != null) {
+            if (exactPlayback && packetController != null && minecraft.level != null) {
                 ReplayClock.prepare(minecraft.level, elapsed, 0.0, false);
             }
             updateFreeCameraFromKeys(elapsed / 1_000_000_000.0);
@@ -203,7 +209,7 @@ public final class ReplayTimelineScreen extends Screen {
         timeline.setArchiveNanos(positionNanos);
         requestAdvance(positionNanos);
         applyDirectorPoseAt(positionNanos);
-        if (packetController != null && minecraft.level != null) {
+        if (exactPlayback && packetController != null && minecraft.level != null) {
             int extraTicks = ReplayClock.prepare(
                     minecraft.level,
                     elapsed,
@@ -302,6 +308,8 @@ public final class ReplayTimelineScreen extends Screen {
             if (worldController.cameraMode() != ReplayWorldController.CameraMode.FREE
                     && minecraft.options.keyShift.matches(keyCode, scanCode)) {
                 worldController.setCameraMode(ReplayWorldController.CameraMode.FREE);
+                desiredAttachedPlayer = null;
+                desiredCameraMode = ReplayWorldController.CameraMode.FREE;
                 updateButtons();
                 return true;
             }
@@ -357,11 +365,11 @@ public final class ReplayTimelineScreen extends Screen {
         if (packetController != null) {
             packetController.close();
             packetController = null;
-            worldController = null;
-        } else if (worldController != null) {
-            worldController.close();
-            worldController = null;
         }
+        if (worldController instanceof ReplayWorldController) {
+            worldController.close();
+        }
+        worldController = null;
         closeForwardCursor();
         if (materializer != null) {
             materializer.close();
@@ -426,24 +434,27 @@ public final class ReplayTimelineScreen extends Screen {
                 }
                 candidate.close();
                 packetController = null;
+                exactPlayback = false;
                 initializeSemanticBackend(packetFailure);
                 return;
             }
             packetIndex = built;
             DreamingRecall.LOGGER.info(
-                    "Packet replay index ready: {} packets, {} bootstrap frames, {} tracks, world starts at {} ns",
+                    "Packet replay index ready: {} packets, {} playable player tracks, {} archive tracks",
                     built.packetCount(),
-                    built.bootstrapFrames().size(),
-                    built.tracks().size(),
-                    built.worldStartNanos()
+                    built.playablePlayers().size(),
+                    built.tracks().size()
             );
-            ReplayWorldSnapshot empty = new ReplayStateAccumulator().snapshotAt(0);
-            index = new ReplayStateIndex(
-                    List.of(new ReplayStateCheckpoint(0, -1, empty)),
-                    built.durationNanos(),
-                    built.worldStartNanos()
-            );
-            backendReady(built.worldStartNanos());
+            if (archive.manifest().sourceKind()
+                    == com.hhy.dreamingrecall.archive.ArchiveManifest.SourceKind.DEDICATED_SERVER) {
+                exactPlayback = false;
+                initializeSemanticBackend(null);
+                return;
+            }
+            PacketReplayIndex.PlayerTrack initial = built.defaultTrack().orElseThrow();
+            exactPlayback = true;
+            index = exactTimelineIndex(built, initial);
+            backendReady(initial.worldStartNanos());
         }));
     }
 
@@ -465,7 +476,9 @@ public final class ReplayTimelineScreen extends Screen {
                 fail(indexFailure);
                 return;
             }
+            semanticIndex = built;
             index = built;
+            exactPlayback = false;
             DreamingRecall.LOGGER.info("Portable replay fallback index ready");
             long requested = semanticFallbackTarget;
             semanticFallbackTarget = -1;
@@ -473,6 +486,18 @@ public final class ReplayTimelineScreen extends Screen {
                     ? Math.min(requested, built.durationNanos())
                     : built.firstPopulatedNanos());
         }));
+    }
+
+    private static ReplayStateIndex exactTimelineIndex(
+            PacketReplayIndex packetIndex,
+            PacketReplayIndex.PlayerTrack track
+    ) {
+        ReplayWorldSnapshot empty = new ReplayStateAccumulator().snapshotAt(0);
+        return new ReplayStateIndex(
+                List.of(new ReplayStateCheckpoint(0, -1, empty)),
+                packetIndex.durationNanos(),
+                track.worldStartNanos()
+        );
     }
 
     private void backendReady(long firstVisible) {
@@ -523,6 +548,10 @@ public final class ReplayTimelineScreen extends Screen {
         ReplayWorldController.CameraMode[] modes = ReplayWorldController.CameraMode.values();
         int next = (worldController.cameraMode().ordinal() + 1) % modes.length;
         worldController.setCameraMode(modes[next]);
+        desiredCameraMode = worldController.cameraMode();
+        desiredAttachedPlayer = worldController.attachedPlayerTarget()
+                .map(ReplayWorldController.PlayerTarget::uuid)
+                .orElse(null);
         updateButtons();
     }
 
@@ -543,7 +572,7 @@ public final class ReplayTimelineScreen extends Screen {
         if (worldController == null) {
             return;
         }
-        java.util.List<ReplayWorldController.PlayerTarget> players = worldController.playerTargets();
+        java.util.List<ReplayWorldController.PlayerTarget> players = playerChoices();
         if (players.isEmpty()) {
             return;
         }
@@ -556,8 +585,109 @@ public final class ReplayTimelineScreen extends Screen {
                     .orElse(-1);
         }
         ReplayWorldController.PlayerTarget target = players.get((index + 1 + players.size()) % players.size());
-        worldController.attachPlayer(target.uuid(), false);
+        if (packetIndex != null && packetIndex.track(target.uuid()).isPresent()) {
+            activateExactPlayer(target.uuid());
+        } else {
+            activateSemanticPlayer(target.uuid());
+        }
+    }
+
+    private java.util.List<ReplayWorldController.PlayerTarget> playerChoices() {
+        rememberVisiblePlayers();
+        if (packetIndex != null) {
+            String dimension = worldController == null ? "" : worldController.activeDimension();
+            for (UUID playerId : packetIndex.playablePlayers()) {
+                knownPlayers.putIfAbsent(playerId, new ReplayWorldController.PlayerTarget(
+                        playerId,
+                        playerId.toString().substring(0, 8),
+                        dimension
+                ));
+            }
+        }
+        return java.util.List.copyOf(knownPlayers.values());
+    }
+
+    private void rememberVisiblePlayers() {
+        if (worldController != null) {
+            worldController.playerTargets().forEach(target -> knownPlayers.put(target.uuid(), target));
+        }
+    }
+
+    private void activateExactPlayer(UUID playerId) {
+        if (packetController == null || packetIndex == null) {
+            activateSemanticPlayer(playerId);
+            return;
+        }
+        PacketReplayIndex.PlayerTrack track = packetIndex.track(playerId).orElse(null);
+        if (track == null) {
+            activateSemanticPlayer(playerId);
+            return;
+        }
+        playing = false;
+        desiredAttachedPlayer = playerId;
+        desiredCameraMode = ReplayWorldController.CameraMode.PLAYER;
+        closeForwardCursor();
+        if (worldController instanceof ReplayWorldController) {
+            worldController.close();
+        }
+        worldController = null;
+        if (!packetController.selectPlayerTrack(playerId)) {
+            activateSemanticPlayer(playerId);
+            return;
+        }
+        exactPlayback = true;
+        index = exactTimelineIndex(packetIndex, track);
+        positionNanos = Math.max(track.worldStartNanos(), Math.min(positionNanos, index.durationNanos()));
+        timeline.setArchiveNanos(positionNanos);
+        requestSeek(positionNanos);
         updateButtons();
+    }
+
+    private void activateSemanticPlayer(UUID playerId) {
+        desiredAttachedPlayer = playerId;
+        desiredCameraMode = ReplayWorldController.CameraMode.PLAYER;
+        if (!exactPlayback && worldController instanceof ReplayWorldController) {
+            attachDesiredPlayer();
+            updateButtons();
+            return;
+        }
+        playing = false;
+        closeForwardCursor();
+        if (packetController != null) {
+            packetController.deactivate();
+        }
+        worldController = null;
+        exactPlayback = false;
+        if (semanticIndex != null && materializer != null) {
+            index = semanticIndex;
+            positionNanos = Math.min(positionNanos, index.durationNanos());
+            timeline.setArchiveNanos(positionNanos);
+            requestSeek(positionNanos);
+        } else {
+            semanticFallbackTarget = positionNanos;
+            initializeSemanticBackend(null);
+        }
+        updateButtons();
+    }
+
+    private void attachDesiredPlayer() {
+        if (worldController == null || desiredAttachedPlayer == null) {
+            return;
+        }
+        boolean present = worldController.playerTargets().stream()
+                .anyMatch(target -> target.uuid().equals(desiredAttachedPlayer));
+        if (present) {
+            UUID attached = worldController.attachedPlayerTarget()
+                    .map(ReplayWorldController.PlayerTarget::uuid)
+                    .orElse(null);
+            if (!desiredAttachedPlayer.equals(attached)) {
+                boolean firstPerson = desiredCameraMode == ReplayWorldController.CameraMode.FIRST_PERSON;
+                worldController.attachPlayer(desiredAttachedPlayer, firstPerson);
+            } else if (worldController.cameraMode() != desiredCameraMode) {
+                worldController.setCameraMode(desiredCameraMode);
+            }
+            rememberVisiblePlayers();
+        }
     }
 
     private UUID attachedPlayer() {
@@ -864,7 +994,7 @@ public final class ReplayTimelineScreen extends Screen {
         closeForwardCursor();
         long generation = ++seekGeneration;
         stateMessage = Component.translatable("screen.dreamingrecall.timeline.seeking");
-        if (packetController != null) {
+        if (exactPlayback && packetController != null) {
             PacketReplayController activePackets = packetController;
             if (target < activePackets.currentNanos()) {
                 worldController = null;
@@ -886,9 +1016,13 @@ public final class ReplayTimelineScreen extends Screen {
                     startSemanticFallback(new IllegalStateException("Packet replay did not create a client world"), target);
                     return;
                 }
-                transientCursorNanos = target;
+                positionNanos = result.archiveNanos();
+                timeline.setArchiveNanos(positionNanos);
+                transientCursorNanos = result.archiveNanos();
                 stateMessage = Component.translatable("screen.dreamingrecall.timeline.exact");
-                applyDirectorPoseAt(target);
+                attachDesiredPlayer();
+                rememberVisiblePlayers();
+                applyDirectorPoseAt(result.archiveNanos());
                 updateButtons();
             }));
             return;
@@ -917,7 +1051,7 @@ public final class ReplayTimelineScreen extends Screen {
     }
 
     private void requestAdvance(long target) {
-        if (packetController != null) {
+        if (exactPlayback && packetController != null) {
             if (advanceInFlight || scrubbing) {
                 return;
             }
@@ -939,6 +1073,8 @@ public final class ReplayTimelineScreen extends Screen {
                 }
                 worldController = activePackets.view();
                 stateMessage = Component.translatable("screen.dreamingrecall.timeline.exact");
+                attachDesiredPlayer();
+                rememberVisiblePlayers();
                 applyDirectorPoseAt(result.archiveNanos());
                 updateButtons();
                 if (!scrubbing && result.archiveNanos() < positionNanos) {
@@ -1002,15 +1138,23 @@ public final class ReplayTimelineScreen extends Screen {
         PacketReplayController failedPackets = packetController;
         packetController = null;
         packetIndex = null;
+        exactPlayback = false;
         worldController = null;
         closeForwardCursor();
         if (failedPackets != null) {
             failedPackets.close();
         }
-        index = null;
         stateMessage = Component.translatable("screen.dreamingrecall.timeline.loading");
-        semanticFallbackTarget = Math.max(0, target);
-        initializeSemanticBackend(packetFailure);
+        if (semanticIndex != null && materializer != null) {
+            index = semanticIndex;
+            positionNanos = Math.min(Math.max(0, target), index.durationNanos());
+            timeline.setArchiveNanos(positionNanos);
+            requestSeek(positionNanos);
+        } else {
+            index = null;
+            semanticFallbackTarget = Math.max(0, target);
+            initializeSemanticBackend(packetFailure);
+        }
     }
 
     private void updateButtons() {
@@ -1046,7 +1190,10 @@ public final class ReplayTimelineScreen extends Screen {
                     "screen.dreamingrecall.timeline.player",
                     worldController == null ? "-" : playerLabel()
             ));
-            playerButton.active = worldController != null && !worldController.playerTargets().isEmpty();
+            playerButton.active = worldController != null && (
+                    !worldController.playerTargets().isEmpty()
+                            || packetIndex != null && !packetIndex.playablePlayers().isEmpty()
+            );
         }
         if (directorButton != null) {
             directorButton.setMessage(Component.translatable(
@@ -1133,6 +1280,8 @@ public final class ReplayTimelineScreen extends Screen {
                 worldController = semantic;
             }
             worldResult = semantic.applySnapshot(next);
+            attachDesiredPlayer();
+            rememberVisiblePlayers();
             applyDirectorPoseAt(next.archiveNanos());
             consumeTransientEntries(semantic, next, emitTransients);
             updateButtons();
@@ -1155,6 +1304,8 @@ public final class ReplayTimelineScreen extends Screen {
                 worldController = semantic;
             }
             worldResult = semantic.applyPlaybackFrame(frame);
+            attachDesiredPlayer();
+            rememberVisiblePlayers();
             applyDirectorPoseAt(next.archiveNanos());
             consumeTransientEntries(semantic, next, emitTransients);
             updateButtons();

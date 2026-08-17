@@ -8,6 +8,7 @@ import com.hhy.dreamingrecall.archive.SegmentReadResult;
 import com.hhy.dreamingrecall.archive.packet.PacketEnvelope;
 import com.hhy.dreamingrecall.archive.packet.PacketEnvelopeCodec;
 import com.hhy.dreamingrecall.archive.packet.PacketScope;
+import com.hhy.dreamingrecall.archive.packet.PacketTrackStatusCodec;
 import com.hhy.dreamingrecall.archive.packet.ProtocolPhase;
 import com.hhy.dreamingrecall.archive.track.TrackNames;
 import com.hhy.dreamingrecall.playback.source.ArchiveDataSource;
@@ -26,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class PacketReplayIndexerTest {
     private static final UUID PLAYER = UUID.fromString("00000000-0000-0000-0000-000000000042");
+    private static final UUID SECOND_PLAYER = UUID.fromString("00000000-0000-0000-0000-000000000043");
 
     @Test
     void indexesBootstrapBeforePlayAndKeepsTrackMetadata() throws Exception {
@@ -81,6 +83,37 @@ class PacketReplayIndexerTest {
         FakeSource source = new FakeSource(List.of(segment(0, 0, 10)), List.of());
 
         assertThrows(CancellationException.class, () -> PacketReplayIndexer.scan(source, cancellation));
+    }
+
+    @Test
+    void keepsPlayerBootstrapsSeparateAndExcludesAnIncompleteTrack() throws Exception {
+        SegmentMetadata segment = segment(0, 0, 300);
+        FakeSource source = new FakeSource(
+                List.of(segment),
+                List.of(
+                        record(0, ProtocolPhase.LOGIN, "minecraft:game_profile", TrackNames.playerClient(PLAYER)),
+                        record(10, ProtocolPhase.CONFIGURATION, "minecraft:registry_data", TrackNames.playerClient(PLAYER)),
+                        record(50, ProtocolPhase.PLAY, "minecraft:login", TrackNames.playerClient(PLAYER)),
+                        record(100, ProtocolPhase.LOGIN, "minecraft:game_profile", TrackNames.playerClient(SECOND_PLAYER)),
+                        record(110, ProtocolPhase.CONFIGURATION, "minecraft:registry_data", TrackNames.playerClient(SECOND_PLAYER)),
+                        record(150, ProtocolPhase.PLAY, "minecraft:login", TrackNames.playerClient(SECOND_PLAYER)),
+                        new ReplayRecord(
+                                CoreRecordType.TRACK_CHECKPOINT.id(),
+                                com.hhy.dreamingrecall.archive.RecordPriority.CONTROL,
+                                200,
+                                4,
+                                "",
+                                PacketTrackStatusCodec.encodeIncomplete(SECOND_PLAYER)
+                        )
+                )
+        );
+
+        PacketReplayIndex index = PacketReplayIndexer.scan(source, new ReadCancellation());
+
+        assertEquals(Set.of(PLAYER), index.playablePlayers());
+        assertEquals(2, index.playerTracks().get(PLAYER).bootstrapFrames().size());
+        assertEquals(2, index.playerTracks().get(SECOND_PLAYER).bootstrapFrames().size());
+        org.junit.jupiter.api.Assertions.assertFalse(index.playerTracks().get(SECOND_PLAYER).complete());
     }
 
     private static SegmentMetadata segment(long sequence, long start, long end) {

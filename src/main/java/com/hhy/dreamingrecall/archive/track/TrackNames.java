@@ -4,6 +4,7 @@ import com.hhy.dreamingrecall.archive.ArchiveFormat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 public final class TrackNames {
@@ -26,6 +27,18 @@ public final class TrackNames {
 
     public static String playerClient(UUID playerId) {
         return PLAYER_CLIENT_PREFIX + Objects.requireNonNull(playerId, "playerId");
+    }
+
+    public static Optional<UUID> playerClientId(String trackId) {
+        Objects.requireNonNull(trackId, "trackId");
+        if (!trackId.startsWith(PLAYER_CLIENT_PREFIX)) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(UUID.fromString(trackId.substring(PLAYER_CLIENT_PREFIX.length())));
+        } catch (IllegalArgumentException invalid) {
+            return Optional.empty();
+        }
     }
 
     public static String visibility(UUID playerId) {

@@ -1,6 +1,7 @@
 package com.hhy.dreamingrecall.mixin;
 
 import com.hhy.dreamingrecall.client.recording.ClientRecordingManager;
+import com.hhy.dreamingrecall.client.recording.ServerPacketTrackUploader;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import net.minecraft.network.PacketDecoder;
@@ -60,6 +61,7 @@ abstract class ClientPacketDecoderMixin {
         Object decoded = output.get(output.size() - 1);
         if (decoded instanceof Packet<?> packet) {
             ClientRecordingManager.INSTANCE.inboundPacket(protocolInfo, packet, frame);
+            ServerPacketTrackUploader.INSTANCE.inboundPacket(protocolInfo, packet, frame);
         }
     }
 }

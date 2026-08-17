@@ -10,6 +10,11 @@ import com.hhy.dreamingrecall.archive.ArchiveAttachmentStore;
 import com.hhy.dreamingrecall.archive.CoreRecordType;
 import com.hhy.dreamingrecall.archive.ReplayRecord;
 import com.hhy.dreamingrecall.archive.RecordPriority;
+import com.hhy.dreamingrecall.archive.packet.PacketEnvelope;
+import com.hhy.dreamingrecall.archive.packet.PacketEnvelopeCodec;
+import com.hhy.dreamingrecall.archive.packet.PacketScope;
+import com.hhy.dreamingrecall.archive.packet.PacketTrackStatusCodec;
+import com.hhy.dreamingrecall.archive.track.TrackNames;
 import com.hhy.dreamingrecall.capture.MinecraftRecordEncoder;
 import com.hhy.dreamingrecall.config.DreamingRecallConfig;
 import com.hhy.dreamingrecall.mixin.ChunkMapAccessor;
@@ -19,7 +24,10 @@ import com.hhy.dreamingrecall.recording.RecordingMetricsSnapshot;
 import com.hhy.dreamingrecall.recording.RecordingPipeline;
 import com.hhy.dreamingrecall.recording.TickCostWindow;
 import com.hhy.dreamingrecall.network.CameraSamplePayload;
+import com.hhy.dreamingrecall.network.ClientPacketBatchPayload;
 import com.hhy.dreamingrecall.network.PlayerVisualSamplePayload;
+import com.hhy.dreamingrecall.playback.decode.DecodedPayload;
+import com.hhy.dreamingrecall.playback.decode.PortableRecordDecoder;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.network.chat.Component;
@@ -48,17 +56,26 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 final class ServerRecordingSession {
     private static final int MAX_CHUNK_CAPTURE_RETRIES = 200;
+    private static final long MAX_PENDING_PACKET_TRACK_BYTES = 32L * 1024 * 1024;
+    private static final PortableRecordDecoder PORTABLE_DECODER = new PortableRecordDecoder();
 
     private final MinecraftServer server;
     private final RecordingPipeline pipeline;
     private final long startMonotonicNanos;
     private final long startServerTick;
     private final RecordingMode mode;
+    private final UUID recordingId;
+    private final ThreadPoolExecutor packetTrackExecutor;
     private final ArrayDeque<PendingChunk> pendingChunks = new ArrayDeque<>();
     private final Set<ChunkKey> pendingChunkKeys = new HashSet<>();
     private final Set<ChunkKey> observedChunks = new HashSet<>();
@@ -72,6 +89,11 @@ final class ServerRecordingSession {
     private final Map<String, Integer> captureFailures = new HashMap<>();
     private final Map<UUID, Long> lastCameraSampleNanos = new HashMap<>();
     private final Map<UUID, Long> lastPlayerVisualSampleNanos = new HashMap<>();
+    private final Map<UUID, PacketUploadState> packetUploadStates = new HashMap<>();
+    private final Set<UUID> incompletePacketTracks = new HashSet<>();
+    private final Set<UUID> packetTrackPlayers = ConcurrentHashMap.newKeySet();
+    private final Object packetTrackStatusLock = new Object();
+    private final AtomicLong pendingPacketTrackBytes = new AtomicLong();
     private final TickCostWindow tickCosts = new TickCostWindow(2048);
 
     private boolean stopping;
@@ -88,13 +110,31 @@ final class ServerRecordingSession {
     ) {
         this.server = server;
         this.mode = mode;
+        this.recordingId = manifest.archiveId();
         this.startMonotonicNanos = System.nanoTime();
         this.startServerTick = server.getTickCount();
         this.pipeline = new RecordingPipeline(
                 archiveRoot,
                 manifest,
                 DreamingRecallConfig.recordingSettings(),
-                failure -> DreamingRecall.LOGGER.error("DreamingRecall archive writer failed", failure)
+                failure -> DreamingRecall.LOGGER.error("DreamingRecall archive writer failed", failure),
+                this::recordingEnhancementDropped
+        );
+        this.packetTrackExecutor = new ThreadPoolExecutor(
+                1,
+                1,
+                0,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(64),
+                task -> {
+                    Thread thread = Thread.ofPlatform()
+                            .name("DreamingRecall-PacketTrack-" + recordingId.toString().substring(0, 8))
+                            .daemon(true)
+                            .unstarted(task);
+                    thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
+                    return thread;
+                },
+                new ThreadPoolExecutor.AbortPolicy()
         );
     }
 
@@ -353,6 +393,165 @@ final class ServerRecordingSession {
         ));
     }
 
+    void clientPacketBatch(ServerPlayer player, ClientPacketBatchPayload batch) {
+        if (stopping || !recordingId.equals(batch.recordingId())) {
+            return;
+        }
+        UUID playerId = player.getUUID();
+        packetTrackPlayers.add(playerId);
+        long arrivalNanos = archiveNanos();
+        long arrivalTick = serverTick();
+        String fallbackDimension = dimensionId(player.serverLevel());
+        int retainedBytes = batch.retainedBytes();
+        long queuedBytes = pendingPacketTrackBytes.addAndGet(retainedBytes);
+        if (queuedBytes > MAX_PENDING_PACKET_TRACK_BYTES) {
+            pendingPacketTrackBytes.addAndGet(-retainedBytes);
+            markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "ingest_byte_backpressure");
+            return;
+        }
+        try {
+            packetTrackExecutor.execute(() -> {
+                try {
+                    ingestPacketBatch(playerId, fallbackDimension, batch, arrivalNanos, arrivalTick);
+                } finally {
+                    pendingPacketTrackBytes.addAndGet(-retainedBytes);
+                }
+            });
+        } catch (RejectedExecutionException overloaded) {
+            pendingPacketTrackBytes.addAndGet(-retainedBytes);
+            markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "ingest_backpressure");
+        }
+    }
+
+    private void ingestPacketBatch(
+            UUID playerId,
+            String fallbackDimension,
+            ClientPacketBatchPayload batch,
+            long arrivalNanos,
+            long arrivalTick
+    ) {
+        synchronized (packetTrackStatusLock) {
+            if (incompletePacketTracks.contains(playerId)) {
+                return;
+            }
+        }
+        PacketUploadState state = packetUploadStates.computeIfAbsent(playerId, ignored -> new PacketUploadState());
+        if (batch.sequence() != state.expectedSequence || batch.discontinuity()) {
+            markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "client_discontinuity");
+            return;
+        }
+        state.expectedSequence++;
+        if (batch.frames().isEmpty()) {
+            return;
+        }
+
+        long newestClientNanos = batch.frames().stream()
+                .mapToLong(ClientPacketBatchPayload.Frame::clientNanos)
+                .max()
+                .orElse(0);
+        for (ClientPacketBatchPayload.Frame frame : batch.frames()) {
+            if (Thread.currentThread().isInterrupted()) {
+                markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "ingest_interrupted");
+                return;
+            }
+            long delta;
+            try {
+                delta = Math.subtractExact(frame.clientNanos(), newestClientNanos);
+            } catch (ArithmeticException invalidClock) {
+                markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "invalid_client_clock");
+                return;
+            }
+            // Retained connection bootstrap may predate the archive. Preserve
+            // ordering without allowing a client clock to escape archive time.
+            delta = Math.max(-30_000_000_000L, Math.min(1_000_000_000L, delta));
+            long mappedNanos = Math.max(0, arrivalNanos + delta);
+            mappedNanos = Math.max(state.lastArchiveNanos, mappedNanos);
+            boolean play = frame.phase() == com.hhy.dreamingrecall.archive.packet.ProtocolPhase.PLAY;
+            String dimension = play
+                    ? (frame.dimensionId().isEmpty() ? fallbackDimension : frame.dimensionId())
+                    : "";
+            try {
+                PacketEnvelope envelope = new PacketEnvelope(
+                        PacketEnvelope.CURRENT_SCHEMA_VERSION,
+                        TrackNames.playerClient(playerId),
+                        frame.phase(),
+                        frame.packetTypeId(),
+                        frame.namespace(),
+                        play ? PacketScope.CLIENT_LOCAL : PacketScope.SESSION,
+                        dimension,
+                        play ? playerId : null,
+                        null,
+                        "",
+                        frame.packetBytes()
+                );
+                OfferResult result = pipeline.offer(new ReplayRecord(
+                        CoreRecordType.PACKET_FRAME.id(),
+                        RecordPriority.ENHANCEMENT,
+                        mappedNanos,
+                        arrivalTick,
+                        dimension,
+                        PacketEnvelopeCodec.encode(envelope)
+                ));
+                if (result != OfferResult.ACCEPTED) {
+                    markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "archive_backpressure");
+                    return;
+                }
+                state.lastArchiveNanos = mappedNanos;
+            } catch (Exception failure) {
+                DreamingRecall.LOGGER.warn("Could not archive uploaded packet track for {}", playerId, failure);
+                markPacketTrackIncomplete(playerId, arrivalNanos, arrivalTick, "invalid_packet_frame");
+                return;
+            }
+        }
+    }
+
+    private void markPacketTrackIncomplete(UUID playerId, long archiveNanos, long serverTick, String reason) {
+        synchronized (packetTrackStatusLock) {
+            if (!incompletePacketTracks.add(playerId)) {
+                return;
+            }
+        }
+        pipeline.offer(new ReplayRecord(
+                CoreRecordType.TRACK_CHECKPOINT.id(),
+                RecordPriority.CONTROL,
+                archiveNanos,
+                serverTick,
+                "",
+                PacketTrackStatusCodec.encodeIncomplete(playerId)
+        ));
+        DreamingRecall.LOGGER.warn(
+                "Player packet track {} became incomplete ({}); semantic replay remains available",
+                playerId,
+                reason
+        );
+    }
+
+    private void recordingEnhancementDropped(ReplayRecord record) {
+        UUID playerId = null;
+        try {
+            if (record.typeId() == CoreRecordType.PACKET_FRAME.id()) {
+                PacketEnvelope envelope = PacketEnvelopeCodec.decode(record.payloadCopy());
+                playerId = TrackNames.playerClientId(envelope.trackId()).orElse(null);
+            } else if (record.typeId() == CoreRecordType.CLIENT_PLAYER_VISUAL_SAMPLE.id()) {
+                DecodedPayload decoded = PORTABLE_DECODER.decode(record);
+                if (decoded instanceof DecodedPayload.PlayerVisualSample visual) {
+                    playerId = visual.playerId();
+                }
+            }
+        } catch (Exception invalidRecord) {
+            DreamingRecall.LOGGER.warn("Could not identify a dropped exact-track record", invalidRecord);
+        }
+        if (playerId != null) {
+            packetTrackPlayers.add(playerId);
+            markPacketTrackIncomplete(
+                    playerId,
+                    record.archiveNanos(),
+                    record.serverTick(),
+                    "archive_enhancement_loss"
+            );
+        }
+    }
+
     ExtensionSubmissionResult submitExtension(
             ReplayExtension extension,
             String channel,
@@ -396,7 +595,30 @@ final class ServerRecordingSession {
         long serverTick = serverTick();
         flushChat(archiveNanos, serverTick);
         flushEntityEffects(archiveNanos, serverTick);
-        pipeline.requestStop(archiveNanos, serverTick);
+        packetTrackExecutor.shutdown();
+        Thread.startVirtualThread(() -> {
+            try {
+                if (!packetTrackExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    packetTrackExecutor.shutdownNow();
+                    packetTrackExecutor.awaitTermination(1, TimeUnit.SECONDS);
+                    packetTrackPlayers.forEach(playerId -> markPacketTrackIncomplete(
+                            playerId,
+                            archiveNanos,
+                            serverTick,
+                            "shutdown_timeout"
+                    ));
+                }
+            } catch (InterruptedException interrupted) {
+                packetTrackExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            } finally {
+                pipeline.requestStop(archiveNanos, serverTick);
+            }
+        });
+    }
+
+    UUID recordingId() {
+        return recordingId;
     }
 
     java.util.Optional<ArchiveAttachmentStore.AttachmentReference> attachResourcePack(Path source, long maxBytes)
@@ -818,5 +1040,10 @@ final class ServerRecordingSession {
     }
 
     private record ChatKey(int deliveryToken, String renderedJson, String kind) {
+    }
+
+    private static final class PacketUploadState {
+        private long expectedSequence;
+        private long lastArchiveNanos;
     }
 }

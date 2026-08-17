@@ -2,6 +2,10 @@ package com.hhy.dreamingrecall.tools;
 
 import com.hhy.dreamingrecall.archive.ArchiveInspection;
 import com.hhy.dreamingrecall.archive.ArchiveInspector;
+import com.hhy.dreamingrecall.archive.ArchiveManifestCodec;
+import com.hhy.dreamingrecall.client.playback.packet.PacketReplayIndexer;
+import com.hhy.dreamingrecall.playback.source.LocalArchiveDataSource;
+import com.hhy.dreamingrecall.playback.source.ReadCancellation;
 
 import java.nio.file.Path;
 
@@ -22,6 +26,19 @@ public final class ArchiveInspectorMain {
         System.out.println("Duration seconds: " + inspection.durationNanos() / 1_000_000_000.0);
         ArchiveInspector.namedRecordCounts(inspection)
                 .forEach((type, count) -> System.out.println("  " + type + ": " + count));
+        var manifest = ArchiveManifestCodec.readManifest(archive);
+        try (LocalArchiveDataSource source = LocalArchiveDataSource.open(archive, manifest.minecraftVersion())) {
+            var packetIndex = PacketReplayIndexer.scan(source, new ReadCancellation());
+            System.out.println("Playable exact player tracks: " + packetIndex.playablePlayers().size());
+            packetIndex.playablePlayers().forEach(playerId -> {
+                var track = packetIndex.track(playerId).orElseThrow();
+                System.out.println(
+                        "  " + playerId
+                                + ": " + track.packetCount() + " frames, world starts at "
+                                + track.worldStartNanos() + " ns"
+                );
+            });
+        }
         inspection.diagnostics().forEach(diagnostic -> System.out.println(
                 "  " + diagnostic.severity() + " " + diagnostic.path() + ": " + diagnostic.message()
         ));

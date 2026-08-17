@@ -7,6 +7,7 @@ import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
 import com.hhy.dreamingrecall.client.playback.packet.PacketReplayViewController;
 import com.hhy.dreamingrecall.client.playback.packet.ReplayPacketDispatchContext;
 import com.hhy.dreamingrecall.client.recording.ClientRecordingManager;
+import com.hhy.dreamingrecall.client.recording.ServerPacketTrackUploader;
 import com.hhy.dreamingrecall.capture.CaptureBridge;
 import com.hhy.dreamingrecall.config.DreamingRecallClientConfig;
 import com.hhy.dreamingrecall.network.CameraSamplePayload;
@@ -75,6 +76,7 @@ public final class DreamingRecallClientEvents {
             startLocalRecordingWhenReady = !ClientRecordingManager.INSTANCE.isRecording();
         }
         ClientRecordingManager.INSTANCE.tick(minecraft);
+        ServerPacketTrackUploader.INSTANCE.tick(minecraft);
         while (DreamingRecallClientModEvents.OPEN_ARCHIVES.consumeClick()) {
             if (!(minecraft.screen instanceof ReplayLibraryScreen)) {
                 minecraft.setScreen(new ReplayLibraryScreen(minecraft.screen));
@@ -150,6 +152,7 @@ public final class DreamingRecallClientEvents {
         }
         startLocalRecordingWhenReady = false;
         ClientRecordingManager.INSTANCE.stop(Minecraft.getInstance());
+        ServerPacketTrackUploader.INSTANCE.disconnected();
     }
 
     @SubscribeEvent
@@ -274,8 +277,12 @@ public final class DreamingRecallClientEvents {
         }
         long now = System.nanoTime();
         boolean localRecording = ClientRecordingManager.INSTANCE.isRecording();
-        boolean uploadPlayerVisual = serverSupports(minecraft, PlayerVisualSamplePayload.TYPE.id());
-        boolean uploadCamera = serverSupports(minecraft, CameraSamplePayload.TYPE.id());
+        boolean serverTrackActive = ServerPacketTrackUploader.INSTANCE.isActive();
+        boolean uploadPlayerVisual = serverTrackActive
+                && serverSupports(minecraft, PlayerVisualSamplePayload.TYPE.id());
+        boolean uploadCamera = serverTrackActive
+                && ServerPacketTrackUploader.INSTANCE.cameraTrackAllowed()
+                && serverSupports(minecraft, CameraSamplePayload.TYPE.id());
         boolean sendPlayerVisual = (localRecording || uploadPlayerVisual)
                 && now - lastPlayerVisualSampleNanos >= PLAYER_VISUAL_SAMPLE_INTERVAL_NANOS;
         long cameraInterval = 1_000_000_000L / DreamingRecallClientConfig.CAMERA_SAMPLE_HZ.get();

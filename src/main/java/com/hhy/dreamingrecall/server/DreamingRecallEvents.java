@@ -3,6 +3,7 @@ package com.hhy.dreamingrecall.server;
 import com.hhy.dreamingrecall.DreamingRecall;
 import net.minecraft.core.Holder;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -13,6 +14,7 @@ import net.neoforged.neoforge.event.PlayLevelSoundEvent;
 import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
 import net.neoforged.neoforge.event.entity.EntityLeaveLevelEvent;
 import net.neoforged.neoforge.event.level.ChunkEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
@@ -41,6 +43,13 @@ public final class DreamingRecallEvents {
     @SubscribeEvent
     public static void onServerStopped(ServerStoppedEvent event) {
         DreamingRecallServer.INSTANCE.serverStopped(event.getServer());
+    }
+
+    @SubscribeEvent
+    public static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            DreamingRecallServer.INSTANCE.playerLoggedIn(player);
+        }
     }
 
     @SubscribeEvent
