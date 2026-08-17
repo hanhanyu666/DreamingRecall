@@ -1,7 +1,12 @@
 package com.hhy.dreamingrecall.client.screen;
 
+import com.hhy.dreamingrecall.DreamingRecall;
 import com.hhy.dreamingrecall.client.library.ClientArchiveEntry;
+import com.hhy.dreamingrecall.client.playback.ReplayClock;
+import com.hhy.dreamingrecall.client.playback.ReplayViewController;
 import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
+import com.hhy.dreamingrecall.client.playback.packet.PacketReplayController;
+import com.hhy.dreamingrecall.client.playback.packet.PacketReplayIndex;
 import com.hhy.dreamingrecall.director.CameraInterpolation;
 import com.hhy.dreamingrecall.director.CameraKeyframe;
 import com.hhy.dreamingrecall.director.CameraPose;
@@ -12,6 +17,8 @@ import com.hhy.dreamingrecall.playback.source.LocalArchiveDataSource;
 import com.hhy.dreamingrecall.playback.state.ReplayForwardCursor;
 import com.hhy.dreamingrecall.playback.state.ReplayPlaybackFrame;
 import com.hhy.dreamingrecall.playback.state.ReplayStateIndex;
+import com.hhy.dreamingrecall.playback.state.ReplayStateAccumulator;
+import com.hhy.dreamingrecall.playback.state.ReplayStateCheckpoint;
 import com.hhy.dreamingrecall.playback.state.ReplayStateMaterializer;
 import com.hhy.dreamingrecall.playback.state.ReplayWorldSnapshot;
 import com.mojang.blaze3d.platform.InputConstants;
@@ -43,10 +50,12 @@ public final class ReplayTimelineScreen extends Screen {
 
     private LocalArchiveDataSource source;
     private ReplayStateMaterializer materializer;
+    private PacketReplayController packetController;
+    private PacketReplayIndex packetIndex;
     private ReplayForwardCursor forwardCursor;
     private ReplayStateIndex index;
     private ReplayWorldSnapshot snapshot;
-    private ReplayWorldController worldController;
+    private ReplayViewController worldController;
     private ReplayWorldController.ApplyResult worldResult;
     private TimelineSlider timeline;
     private Button playButton;
@@ -81,6 +90,8 @@ public final class ReplayTimelineScreen extends Screen {
     private Component directorMessage = Component.empty();
     private long transientCursorNanos = -1;
     private boolean hudVisible = true;
+    private boolean semanticFallbackStarting;
+    private long semanticFallbackTarget = -1;
 
     public ReplayTimelineScreen(Screen parent, ClientArchiveEntry archive) {
         super(Component.translatable("screen.dreamingrecall.timeline.title"));
@@ -165,6 +176,7 @@ public final class ReplayTimelineScreen extends Screen {
 
     @Override
     public void tick() {
+        updatePlaybackFrameClock();
     }
 
     private void updatePlaybackFrameClock() {
@@ -175,6 +187,9 @@ public final class ReplayTimelineScreen extends Screen {
         long elapsed = Math.max(0, now - lastTickNanos);
         lastTickNanos = now;
         if (!playing || scrubbing || index == null) {
+            if (packetController != null && minecraft.level != null) {
+                ReplayClock.prepare(minecraft.level, elapsed, 0.0, false);
+            }
             updateFreeCameraFromKeys(elapsed / 1_000_000_000.0);
             applyDirectorPoseAt(positionNanos);
             return;
@@ -188,12 +203,23 @@ public final class ReplayTimelineScreen extends Screen {
         timeline.setArchiveNanos(positionNanos);
         requestAdvance(positionNanos);
         applyDirectorPoseAt(positionNanos);
+        if (packetController != null && minecraft.level != null) {
+            int extraTicks = ReplayClock.prepare(
+                    minecraft.level,
+                    elapsed,
+                    SPEEDS[speedIndex],
+                    true
+            );
+            ReplayClock.runExtraTicks(minecraft.level, extraTicks);
+        }
         updateFreeCameraFromKeys(elapsed / 1_000_000_000.0);
     }
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
-        updatePlaybackFrameClock();
+        if (minecraft.level == null) {
+            graphics.fill(0, 0, width, height, 0xFF101318);
+        }
         if (hudVisible) {
             int topHeight = width < 900 ? 52 : 28;
             graphics.fill(0, 0, width, topHeight, 0x90000000);
@@ -328,7 +354,11 @@ public final class ReplayTimelineScreen extends Screen {
     @Override
     public void removed() {
         closed = true;
-        if (worldController != null) {
+        if (packetController != null) {
+            packetController.close();
+            packetController = null;
+            worldController = null;
+        } else if (worldController != null) {
             worldController.close();
             worldController = null;
         }
@@ -373,31 +403,92 @@ public final class ReplayTimelineScreen extends Screen {
                         return;
                     }
                     source = opened;
-                    materializer = new ReplayStateMaterializer(opened);
-                    materializer.buildIndex().whenComplete((built, indexFailure) -> minecraft.execute(() -> {
-                        if (closed || minecraft.screen != this) {
-                            return;
-                        }
-                        if (indexFailure != null) {
-                            fail(indexFailure);
-                            return;
-                        }
-                        index = built;
-                        stateMessage = Component.translatable("screen.dreamingrecall.timeline.ready");
-                        timeline.active = true;
-                        playButton.active = built.durationNanos() > 0;
-                        speedButton.active = true;
-                        loadDirectorProject();
-                        long firstVisible = built.firstPopulatedNanos();
-                        positionNanos = firstVisible;
-                        timeline.setArchiveNanos(firstVisible);
-                        requestSeek(firstVisible);
-                    }));
+                    initializePacketBackend(opened);
                 }));
+    }
+
+    private void initializePacketBackend(LocalArchiveDataSource opened) {
+        PacketReplayController candidate = new PacketReplayController(minecraft, opened);
+        packetController = candidate;
+        candidate.buildIndex().whenComplete((built, packetFailure) -> minecraft.execute(() -> {
+            if (closed || minecraft.screen != this || packetController != candidate) {
+                candidate.close();
+                return;
+            }
+            if (packetFailure != null || built == null || !built.playable()) {
+                if (packetFailure != null) {
+                    DreamingRecall.LOGGER.warn(
+                            "Packet replay indexing failed; using portable fallback",
+                            rootCause(packetFailure)
+                    );
+                } else {
+                    DreamingRecall.LOGGER.info("Archive has no playable packet track; using portable fallback");
+                }
+                candidate.close();
+                packetController = null;
+                initializeSemanticBackend(packetFailure);
+                return;
+            }
+            packetIndex = built;
+            DreamingRecall.LOGGER.info(
+                    "Packet replay index ready: {} packets, {} bootstrap frames, {} tracks, world starts at {} ns",
+                    built.packetCount(),
+                    built.bootstrapFrames().size(),
+                    built.tracks().size(),
+                    built.worldStartNanos()
+            );
+            ReplayWorldSnapshot empty = new ReplayStateAccumulator().snapshotAt(0);
+            index = new ReplayStateIndex(
+                    List.of(new ReplayStateCheckpoint(0, -1, empty)),
+                    built.durationNanos(),
+                    built.worldStartNanos()
+            );
+            backendReady(built.worldStartNanos());
+        }));
+    }
+
+    private void initializeSemanticBackend(Throwable packetFailure) {
+        if (materializer != null || semanticFallbackStarting || source == null) {
+            return;
+        }
+        semanticFallbackStarting = true;
+        materializer = new ReplayStateMaterializer(source);
+        materializer.buildIndex().whenComplete((built, indexFailure) -> minecraft.execute(() -> {
+            semanticFallbackStarting = false;
+            if (closed || minecraft.screen != this) {
+                return;
+            }
+            if (indexFailure != null) {
+                if (packetFailure != null) {
+                    indexFailure.addSuppressed(rootCause(packetFailure));
+                }
+                fail(indexFailure);
+                return;
+            }
+            index = built;
+            DreamingRecall.LOGGER.info("Portable replay fallback index ready");
+            long requested = semanticFallbackTarget;
+            semanticFallbackTarget = -1;
+            backendReady(requested >= 0
+                    ? Math.min(requested, built.durationNanos())
+                    : built.firstPopulatedNanos());
+        }));
+    }
+
+    private void backendReady(long firstVisible) {
+        stateMessage = Component.translatable("screen.dreamingrecall.timeline.ready");
+        timeline.active = true;
+        playButton.active = index.durationNanos() > 0;
+        speedButton.active = true;
+        loadDirectorProject();
+        positionNanos = firstVisible;
+        timeline.setArchiveNanos(firstVisible);
+        requestSeek(firstVisible);
     }
 
     private void fail(Throwable failed) {
         failure = rootCause(failed);
+        DreamingRecall.LOGGER.error("Replay playback failed", failure);
         playing = false;
         stateMessage = Component.translatable(
                 "screen.dreamingrecall.timeline.failed",
@@ -444,7 +535,7 @@ public final class ReplayTimelineScreen extends Screen {
             return;
         }
         int current = dimensions.indexOf(worldController.activeDimension());
-        worldController.setDimension(dimensions.get((current + 1 + dimensions.size()) % dimensions.size()));
+        worldController.selectDimension(dimensions.get((current + 1 + dimensions.size()) % dimensions.size()));
         updateButtons();
     }
 
@@ -470,12 +561,9 @@ public final class ReplayTimelineScreen extends Screen {
     }
 
     private UUID attachedPlayer() {
-        // The controller intentionally exposes targets rather than mutable internals. The selected target is inferred
-        // from the camera mode and current camera entity when the UI needs to cycle again.
-        if (minecraft.getCameraEntity() instanceof net.minecraft.client.player.RemotePlayer remote) {
-            return remote.getUUID();
-        }
-        return null;
+        return worldController == null
+                ? null
+                : worldController.attachedPlayerTarget().map(ReplayWorldController.PlayerTarget::uuid).orElse(null);
     }
 
     private void loadDirectorProject() {
@@ -764,14 +852,50 @@ public final class ReplayTimelineScreen extends Screen {
     }
 
     private void requestSeek(long target) {
-        if (materializer == null || index == null) {
+        if (index == null) {
             return;
         }
         if (worldController != null) {
             worldController.notifySeekStarted();
         }
+        // Invalidate any in-flight forward step before starting a seek. Its
+        // completion may arrive later on the client thread and must not move
+        // the newly selected replay position back or forward.
+        closeForwardCursor();
         long generation = ++seekGeneration;
         stateMessage = Component.translatable("screen.dreamingrecall.timeline.seeking");
+        if (packetController != null) {
+            PacketReplayController activePackets = packetController;
+            if (target < activePackets.currentNanos()) {
+                worldController = null;
+            }
+            activePackets.seek(target).whenComplete((result, seekFailure) -> minecraft.execute(() -> {
+                if (closed || generation != seekGeneration || minecraft.screen != this
+                        || packetController != activePackets) {
+                    return;
+                }
+                if (seekFailure != null) {
+                    Throwable root = rootCause(seekFailure);
+                    if (!(root instanceof java.util.concurrent.CancellationException)) {
+                        startSemanticFallback(root, target);
+                    }
+                    return;
+                }
+                worldController = activePackets.view();
+                if (!result.worldReady() || worldController == null) {
+                    startSemanticFallback(new IllegalStateException("Packet replay did not create a client world"), target);
+                    return;
+                }
+                transientCursorNanos = target;
+                stateMessage = Component.translatable("screen.dreamingrecall.timeline.exact");
+                applyDirectorPoseAt(target);
+                updateButtons();
+            }));
+            return;
+        }
+        if (materializer == null) {
+            return;
+        }
         materializer.seek(target).whenComplete((result, seekFailure) -> minecraft.execute(() -> {
             if (closed || generation != seekGeneration || minecraft.screen != this) {
                 return;
@@ -793,6 +917,36 @@ public final class ReplayTimelineScreen extends Screen {
     }
 
     private void requestAdvance(long target) {
+        if (packetController != null) {
+            if (advanceInFlight || scrubbing) {
+                return;
+            }
+            PacketReplayController activePackets = packetController;
+            long generation = cursorGeneration;
+            advanceInFlight = true;
+            activePackets.seek(target).whenComplete((result, advanceFailure) -> minecraft.execute(() -> {
+                if (closed || generation != cursorGeneration || minecraft.screen != this
+                        || packetController != activePackets) {
+                    return;
+                }
+                advanceInFlight = false;
+                if (advanceFailure != null) {
+                    Throwable root = rootCause(advanceFailure);
+                    if (!(root instanceof java.util.concurrent.CancellationException)) {
+                        startSemanticFallback(root, target);
+                    }
+                    return;
+                }
+                worldController = activePackets.view();
+                stateMessage = Component.translatable("screen.dreamingrecall.timeline.exact");
+                applyDirectorPoseAt(result.archiveNanos());
+                updateButtons();
+                if (!scrubbing && result.archiveNanos() < positionNanos) {
+                    requestAdvance(positionNanos);
+                }
+            }));
+            return;
+        }
         if (forwardCursor == null || advanceInFlight || scrubbing) {
             return;
         }
@@ -830,10 +984,33 @@ public final class ReplayTimelineScreen extends Screen {
     private void closeForwardCursor() {
         cursorGeneration++;
         advanceInFlight = false;
+        if (packetController != null) {
+            packetController.cancelSeek();
+        }
         if (forwardCursor != null) {
             forwardCursor.close();
             forwardCursor = null;
         }
+    }
+
+    private void startSemanticFallback(Throwable packetFailure, long target) {
+        DreamingRecall.LOGGER.error(
+                "Exact packet replay failed at {} ns; switching to portable fallback",
+                target,
+                rootCause(packetFailure)
+        );
+        PacketReplayController failedPackets = packetController;
+        packetController = null;
+        packetIndex = null;
+        worldController = null;
+        closeForwardCursor();
+        if (failedPackets != null) {
+            failedPackets.close();
+        }
+        index = null;
+        stateMessage = Component.translatable("screen.dreamingrecall.timeline.loading");
+        semanticFallbackTarget = Math.max(0, target);
+        initializeSemanticBackend(packetFailure);
     }
 
     private void updateButtons() {
@@ -909,6 +1086,12 @@ public final class ReplayTimelineScreen extends Screen {
         }
     }
 
+    public boolean shouldRenderVanillaHud() {
+        return hudVisible
+                && worldController != null
+                && worldController.cameraMode() == ReplayWorldController.CameraMode.FIRST_PERSON;
+    }
+
     private void renderDirectorOverlay(GuiGraphics graphics) {
         if (timeline == null || directorProject == null || index == null) {
             return;
@@ -942,14 +1125,16 @@ public final class ReplayTimelineScreen extends Screen {
             return;
         }
         try {
-            if (worldController == null) {
-                worldController = new ReplayWorldController(minecraft, next, archive.manifest().archiveId());
+            ReplayWorldController semantic;
+            if (worldController instanceof ReplayWorldController existing) {
+                semantic = existing;
             } else {
-                worldResult = worldController.applySnapshot(next);
+                semantic = new ReplayWorldController(minecraft, next, archive.manifest().archiveId());
+                worldController = semantic;
             }
-            worldResult = worldController.result();
+            worldResult = semantic.applySnapshot(next);
             applyDirectorPoseAt(next.archiveNanos());
-            consumeTransientEntries(next, emitTransients);
+            consumeTransientEntries(semantic, next, emitTransients);
             updateButtons();
         } catch (RuntimeException | LinkageError worldFailure) {
             fail(worldFailure);
@@ -962,19 +1147,27 @@ public final class ReplayTimelineScreen extends Screen {
             return;
         }
         try {
-            if (worldController == null) {
-                worldController = new ReplayWorldController(minecraft, next, archive.manifest().archiveId());
+            ReplayWorldController semantic;
+            if (worldController instanceof ReplayWorldController existing) {
+                semantic = existing;
+            } else {
+                semantic = new ReplayWorldController(minecraft, next, archive.manifest().archiveId());
+                worldController = semantic;
             }
-            worldResult = worldController.applyPlaybackFrame(frame);
+            worldResult = semantic.applyPlaybackFrame(frame);
             applyDirectorPoseAt(next.archiveNanos());
-            consumeTransientEntries(next, emitTransients);
+            consumeTransientEntries(semantic, next, emitTransients);
             updateButtons();
         } catch (RuntimeException | LinkageError worldFailure) {
             fail(worldFailure);
         }
     }
 
-    private void consumeTransientEntries(ReplayWorldSnapshot next, boolean emit) {
+    private void consumeTransientEntries(
+            ReplayWorldController semantic,
+            ReplayWorldSnapshot next,
+            boolean emit
+    ) {
         if (!emit || transientCursorNanos < 0 || next.archiveNanos() < transientCursorNanos) {
             transientCursorNanos = next.archiveNanos();
             return;
@@ -997,10 +1190,10 @@ public final class ReplayTimelineScreen extends Screen {
                 });
         next.recentSounds().stream()
                 .filter(entry -> entry.archiveNanos() > previous && entry.archiveNanos() <= next.archiveNanos())
-                .forEach(worldController::playSound);
+                .forEach(semantic::playSound);
         next.recentEntityEffects().stream()
                 .filter(entry -> entry.archiveNanos() > previous && entry.archiveNanos() <= next.archiveNanos())
-                .forEach(worldController::playEntityEffect);
+                .forEach(semantic::playEntityEffect);
         transientCursorNanos = next.archiveNanos();
     }
 

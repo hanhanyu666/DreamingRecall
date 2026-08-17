@@ -59,6 +59,7 @@ public final class RecordingPipeline {
     private volatile Path archiveDirectory;
 
     private long lastAcceptedSequence;
+    private long lastAcceptedArchiveNanos;
     private volatile long stopArchiveNanos;
     private volatile long stopServerTick;
 
@@ -104,10 +105,13 @@ public final class RecordingPipeline {
             }
             long currentBytes = queuedBytes.get();
             if (currentBytes + retainedBytes <= settings.maxQueuedBytes()) {
+                long orderedArchiveNanos = Math.max(lastAcceptedArchiveNanos, record.archiveNanos());
+                ReplayRecord orderedRecord = withArchiveNanos(record, orderedArchiveNanos);
                 long sequence = lastAcceptedSequence + 1;
-                QueuedRecord queued = new QueuedRecord(sequence, record, retainedBytes);
+                QueuedRecord queued = new QueuedRecord(sequence, orderedRecord, retainedBytes);
                 if (queue.offer(queued)) {
                     lastAcceptedSequence = sequence;
+                    lastAcceptedArchiveNanos = orderedArchiveNanos;
                     long updatedBytes = queuedBytes.addAndGet(retainedBytes);
                     metrics.accepted(queue.size(), updatedBytes);
                     return OfferResult.ACCEPTED;
@@ -241,6 +245,7 @@ public final class RecordingPipeline {
             long processedQueueSequence = 0;
             long segmentOpenedAt = System.nanoTime();
             long lastCheckpointNanos = Long.MIN_VALUE;
+            long lastWrittenArchiveNanos = 0;
             int estimatedSegmentBytes = 0;
             ArrayList<ReplayRecord> segment = new ArrayList<>();
             ReplayCheckpointBuilder checkpointBuilder = new ReplayCheckpointBuilder();
@@ -263,13 +268,18 @@ public final class RecordingPipeline {
                 QueuedRecord queued = queue.poll(settings.writerPollInterval().toMillis(), TimeUnit.MILLISECONDS);
                 if (queued != null) {
                     queuedBytes.addAndGet(-queued.retainedBytes());
-                    ReplayRecord archivedRecord = externalizeContent(contentStore, queued.record());
+                    ReplayRecord orderedRecord = withArchiveNanos(
+                            queued.record(),
+                            Math.max(lastWrittenArchiveNanos, queued.record().archiveNanos())
+                    );
+                    ReplayRecord archivedRecord = externalizeContent(contentStore, orderedRecord);
                     segment.add(archivedRecord);
+                    lastWrittenArchiveNanos = archivedRecord.archiveNanos();
                     estimatedSegmentBytes += estimatedRetainedBytes(archivedRecord);
                     processedQueueSequence = queued.sequence();
                     if (checkpointingAvailable) {
                         try {
-                            checkpointBuilder.accept(queued.record(), archivedRecord);
+                            checkpointBuilder.accept(orderedRecord, archivedRecord);
                         } catch (IOException | RuntimeException checkpointFailure) {
                             checkpointingAvailable = false;
                             checkpointWriter.disable();
@@ -284,8 +294,12 @@ public final class RecordingPipeline {
 
                 Optional<GapSnapshot> gap = gaps.drainReady(processedQueueSequence);
                 if (gap.isPresent()) {
-                    ReplayRecord gapRecord = gapRecord(gap.get(), stopServerTick);
+                    ReplayRecord gapRecord = withArchiveNanos(
+                            gapRecord(gap.get(), stopServerTick),
+                            Math.max(lastWrittenArchiveNanos, gap.get().endArchiveNanos())
+                    );
                     segment.add(gapRecord);
+                    lastWrittenArchiveNanos = gapRecord.archiveNanos();
                     estimatedSegmentBytes += estimatedRetainedBytes(gapRecord);
                 }
 
@@ -325,14 +339,22 @@ public final class RecordingPipeline {
 
             Optional<GapSnapshot> finalGap = gaps.drainReady(Long.MAX_VALUE);
             if (finalGap.isPresent()) {
-                segment.add(gapRecord(finalGap.get(), stopServerTick));
+                ReplayRecord gapRecord = withArchiveNanos(
+                        gapRecord(finalGap.get(), stopServerTick),
+                        Math.max(lastWrittenArchiveNanos, finalGap.get().endArchiveNanos())
+                );
+                segment.add(gapRecord);
+                lastWrittenArchiveNanos = gapRecord.archiveNanos();
             }
-            segment.add(ReplayRecord.control(
+            long completionArchiveNanos = Math.max(lastWrittenArchiveNanos, stopArchiveNanos);
+            ReplayRecord sessionEnd = withArchiveNanos(ReplayRecord.control(
                     CoreRecordType.SESSION_END,
-                    stopArchiveNanos,
+                    completionArchiveNanos,
                     stopServerTick,
                     new byte[0]
-            ));
+            ), completionArchiveNanos);
+            segment.add(sessionEnd);
+            lastWrittenArchiveNanos = sessionEnd.archiveNanos();
             SegmentMetadata committed = SegmentCodec.commit(
                     archiveDirectory.resolve("segments"),
                     sequence++,
@@ -343,7 +365,7 @@ public final class RecordingPipeline {
             if (checkpointingAvailable && checkpointBuilder.canCheckpoint()) {
                 checkpointWriter.submit(
                         committed,
-                        checkpointBuilder.snapshotRecords(stopArchiveNanos, stopServerTick)
+                        checkpointBuilder.snapshotRecords(completionArchiveNanos, stopServerTick)
                 );
             }
             checkpointWriter.close();
@@ -351,7 +373,7 @@ public final class RecordingPipeline {
             RecordingMetricsSnapshot snapshot = metrics();
             ArchiveManifestCodec.writeCompletion(archiveDirectory, new ArchiveCompletion(
                     Instant.now().toEpochMilli(),
-                    stopArchiveNanos,
+                    completionArchiveNanos,
                     sequence,
                     snapshot.acceptedRecords(),
                     snapshot.droppedEnhancementRecords(),
@@ -387,6 +409,20 @@ public final class RecordingPipeline {
     private static int estimatedRetainedBytes(ReplayRecord record) {
         int dimensionBytes = record.dimensionId().getBytes(StandardCharsets.UTF_8).length;
         return 64 + dimensionBytes + record.payloadSize();
+    }
+
+    private static ReplayRecord withArchiveNanos(ReplayRecord record, long archiveNanos) {
+        if (record.archiveNanos() == archiveNanos) {
+            return record;
+        }
+        return new ReplayRecord(
+                record.typeId(),
+                record.priority(),
+                archiveNanos,
+                record.serverTick(),
+                record.dimensionId(),
+                record.payloadCopy()
+        );
     }
 
     private static ReplayRecord externalizeContent(ContentAddressedStore store, ReplayRecord record) throws IOException {

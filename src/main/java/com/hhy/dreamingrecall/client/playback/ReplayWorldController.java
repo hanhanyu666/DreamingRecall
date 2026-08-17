@@ -62,7 +62,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
-public final class ReplayWorldController implements AutoCloseable {
+public final class ReplayWorldController implements ReplayViewController {
     private static final int VIEW_DISTANCE = 16;
     private static final long TICK_NANOS = 50_000_000L;
     private static final int CAMERA_ENTITY_ID = 1_900_000_000;
@@ -228,6 +228,11 @@ public final class ReplayWorldController implements AutoCloseable {
             refreshWorkingSet(true);
         }
         return result();
+    }
+
+    @Override
+    public void selectDimension(String dimensionId) {
+        setDimension(dimensionId);
     }
 
     public void setCameraMode(CameraMode mode) {

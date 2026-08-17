@@ -1,6 +1,7 @@
 package com.hhy.dreamingrecall.mixin;
 
 import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
+import com.hhy.dreamingrecall.client.playback.packet.PacketReplayViewController;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.ItemInHandRenderer;
@@ -12,7 +13,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ItemInHandRenderer.class)
 abstract class ItemInHandRendererMixin {
-    @Inject(method = "renderHandsWithItems", at = @At("HEAD"))
+    @Inject(method = "renderHandsWithItems", at = @At("HEAD"), cancellable = true)
     private void dreamingrecall$showReplayHands(
             float partialTicks,
             PoseStack poseStack,
@@ -21,6 +22,10 @@ abstract class ItemInHandRendererMixin {
             int combinedLight,
             CallbackInfo callback
     ) {
+        if (PacketReplayViewController.shouldSuppressFirstPersonHand()) {
+            callback.cancel();
+            return;
+        }
         ReplayWorldController.setReplayHandRenderPhase(player, true);
     }
 

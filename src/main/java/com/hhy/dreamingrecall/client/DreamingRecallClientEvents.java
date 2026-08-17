@@ -2,7 +2,10 @@ package com.hhy.dreamingrecall.client;
 
 import com.hhy.dreamingrecall.DreamingRecall;
 import com.hhy.dreamingrecall.client.screen.ReplayLibraryScreen;
+import com.hhy.dreamingrecall.client.screen.ReplayTimelineScreen;
 import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
+import com.hhy.dreamingrecall.client.playback.packet.PacketReplayViewController;
+import com.hhy.dreamingrecall.client.playback.packet.ReplayPacketDispatchContext;
 import com.hhy.dreamingrecall.client.recording.ClientRecordingManager;
 import com.hhy.dreamingrecall.capture.CaptureBridge;
 import com.hhy.dreamingrecall.config.DreamingRecallClientConfig;
@@ -35,6 +38,7 @@ import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.ClientChatReceivedEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.RenderFrameEvent;
+import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.client.event.RenderLivingEvent;
 import net.neoforged.neoforge.client.event.ScreenEvent;
 import net.neoforged.neoforge.network.PacketDistributor;
@@ -62,6 +66,10 @@ public final class DreamingRecallClientEvents {
     @SubscribeEvent
     public static void clientTick(ClientTickEvent.Post event) {
         Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level != null && (ReplayWorldController.isReplayLevel(minecraft.level)
+                || PacketReplayViewController.isReplayLevel(minecraft.level))) {
+            startLocalRecordingWhenReady = false;
+        }
         if (startLocalRecordingWhenReady && minecraft.level != null && minecraft.player != null) {
             ClientRecordingManager.INSTANCE.start(minecraft);
             startLocalRecordingWhenReady = !ClientRecordingManager.INSTANCE.isRecording();
@@ -94,7 +102,8 @@ public final class DreamingRecallClientEvents {
 
     @SubscribeEvent
     public static void suppressReplayCameraEntities(RenderLivingEvent.Pre<?, ?> event) {
-        if (ReplayWorldController.shouldSuppressReplayEntityRender(event.getEntity())) {
+        if (ReplayWorldController.shouldSuppressReplayEntityRender(event.getEntity())
+                || PacketReplayViewController.shouldSuppressReplayEntityRender(event.getEntity())) {
             event.setCanceled(true);
         }
     }
@@ -108,14 +117,24 @@ public final class DreamingRecallClientEvents {
     }
 
     @SubscribeEvent
+    public static void suppressVanillaReplayHud(RenderGuiEvent.Pre event) {
+        if (Minecraft.getInstance().screen instanceof ReplayTimelineScreen replay
+                && !replay.shouldRenderVanillaHud()) {
+            event.setCanceled(true);
+        }
+    }
+
+    @SubscribeEvent
     public static void playerLoggingIn(ClientPlayerNetworkEvent.LoggingIn event) {
-        if (!DreamingRecallClientConfig.RECORD_ON_JOIN.get()) {
+        if (ReplayPacketDispatchContext.isActive() || !DreamingRecallClientConfig.RECORD_ON_JOIN.get()) {
             return;
         }
         Minecraft minecraft = Minecraft.getInstance();
         lastCameraSampleNanos = 0;
         lastPlayerVisualSampleNanos = 0;
-        if (serverSupports(minecraft, StartRecordingRequestPayload.TYPE.id())) {
+        if (minecraft.getSingleplayerServer() != null) {
+            ClientRecordingManager.INSTANCE.start(minecraft);
+        } else if (serverSupports(minecraft, StartRecordingRequestPayload.TYPE.id())) {
             PacketDistributor.sendToServer(StartRecordingRequestPayload.INSTANCE);
         } else {
             startLocalRecordingWhenReady = true;
@@ -126,6 +145,9 @@ public final class DreamingRecallClientEvents {
 
     @SubscribeEvent
     public static void playerLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
+        if (ReplayPacketDispatchContext.isActive()) {
+            return;
+        }
         startLocalRecordingWhenReady = false;
         ClientRecordingManager.INSTANCE.stop(Minecraft.getInstance());
     }
@@ -246,7 +268,8 @@ public final class DreamingRecallClientEvents {
         if (minecraft.player == null
                 || minecraft.level == null
                 || minecraft.getConnection() == null
-                || ReplayWorldController.isReplayLevel(minecraft.level)) {
+                || ReplayWorldController.isReplayLevel(minecraft.level)
+                || PacketReplayViewController.isReplayLevel(minecraft.level)) {
             return;
         }
         long now = System.nanoTime();

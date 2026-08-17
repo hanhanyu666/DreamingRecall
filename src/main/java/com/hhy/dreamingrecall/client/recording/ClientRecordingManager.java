@@ -5,10 +5,21 @@ import com.hhy.dreamingrecall.archive.ArchiveManifest;
 import com.hhy.dreamingrecall.archive.CoreRecordType;
 import com.hhy.dreamingrecall.archive.RecordPriority;
 import com.hhy.dreamingrecall.archive.ReplayRecord;
+import com.hhy.dreamingrecall.archive.packet.PacketEnvelope;
+import com.hhy.dreamingrecall.archive.packet.PacketEnvelopeCodec;
+import com.hhy.dreamingrecall.archive.packet.PacketScope;
+import com.hhy.dreamingrecall.archive.packet.ProtocolPhase;
+import com.hhy.dreamingrecall.archive.registry.RegistryManifestCodec;
+import com.hhy.dreamingrecall.archive.registry.RuntimeRegistryManifest;
+import com.hhy.dreamingrecall.archive.track.TrackNames;
 import com.hhy.dreamingrecall.capture.BinaryPayloads;
 import com.hhy.dreamingrecall.capture.CaptureBridge;
 import com.hhy.dreamingrecall.capture.MinecraftRecordEncoder;
 import com.hhy.dreamingrecall.client.library.ClientArchiveLibrary;
+import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
+import com.hhy.dreamingrecall.client.playback.packet.PacketReplayViewController;
+import com.hhy.dreamingrecall.client.playback.packet.ReplayPacketDispatchContext;
+import com.hhy.dreamingrecall.config.DreamingRecallClientConfig;
 import com.hhy.dreamingrecall.network.CameraSamplePayload;
 import com.hhy.dreamingrecall.network.PlayerVisualSamplePayload;
 import com.hhy.dreamingrecall.recording.OfferResult;
@@ -21,7 +32,12 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
+import net.minecraft.network.ConnectionProtocol;
+import net.minecraft.network.ProtocolInfo;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.login.ClientboundGameProfilePacket;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.entity.Entity;
@@ -42,11 +58,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 
 public final class ClientRecordingManager implements CaptureBridge.ClientSink {
     public static final ClientRecordingManager INSTANCE = new ClientRecordingManager();
 
-    private ClientSession session;
+    private volatile ClientSession session;
 
     private ClientRecordingManager() {
     }
@@ -55,15 +72,24 @@ public final class ClientRecordingManager implements CaptureBridge.ClientSink {
         return session != null && session.pipeline.state() != PipelineState.FAILED;
     }
 
-    public void start(Minecraft minecraft) {
-        if (session != null || minecraft.level == null || minecraft.player == null) {
+    public synchronized void start(Minecraft minecraft) {
+        start(minecraft, true);
+    }
+
+    private void start(Minecraft minecraft, boolean announce) {
+        if (session != null
+                || ReplayPacketDispatchContext.isActive()
+                || minecraft.level != null && (ReplayWorldController.isReplayLevel(minecraft.level)
+                || PacketReplayViewController.isReplayLevel(minecraft.level))) {
             return;
         }
         Path archiveRoot = ClientArchiveLibrary.importedArchiveRoot(minecraft.gameDirectory.toPath());
         ArchiveManifest manifest = ArchiveManifest.create(
                 SharedConstants.getCurrentVersion().getName(),
                 DreamingRecall.VERSION,
-                ArchiveManifest.SourceKind.CLIENT_MULTIPLAYER
+                minecraft.getSingleplayerServer() == null
+                        ? ArchiveManifest.SourceKind.CLIENT_MULTIPLAYER
+                        : ArchiveManifest.SourceKind.SINGLEPLAYER
         );
         RecordingPipeline pipeline = new RecordingPipeline(
                 archiveRoot,
@@ -74,14 +100,18 @@ public final class ClientRecordingManager implements CaptureBridge.ClientSink {
         ClientSession created = new ClientSession(pipeline);
         session = created;
         pipeline.start();
-        created.switchLevel(minecraft, minecraft.level, "initial");
-        minecraft.player.displayClientMessage(
-                Component.translatable("message.dreamingrecall.client_recording_started"),
-                false
-        );
+        if (minecraft.level != null) {
+            created.switchLevel(minecraft, minecraft.level, "initial");
+        }
+        if (announce && minecraft.player != null) {
+            minecraft.player.displayClientMessage(
+                    Component.translatable("message.dreamingrecall.client_recording_started"),
+                    false
+            );
+        }
     }
 
-    public void stop(Minecraft minecraft) {
+    public synchronized void stop(Minecraft minecraft) {
         ClientSession current = session;
         session = null;
         if (current == null) {
@@ -105,16 +135,20 @@ public final class ClientRecordingManager implements CaptureBridge.ClientSink {
 
     public void tick(Minecraft minecraft) {
         ClientSession current = session;
-        if (current == null || minecraft.level == null || minecraft.player == null) {
+        if (current == null) {
             return;
         }
-        current.tick(minecraft);
+        if (minecraft.level != null && minecraft.player != null) {
+            current.tick(minecraft);
+        }
         if (current.pipeline.state() == PipelineState.FAILED) {
             session = null;
-            minecraft.player.displayClientMessage(
-                    Component.translatable("message.dreamingrecall.client_recording_failed"),
-                    false
-            );
+            if (minecraft.player != null) {
+                minecraft.player.displayClientMessage(
+                        Component.translatable("message.dreamingrecall.client_recording_failed"),
+                        false
+                );
+            }
         }
     }
 
@@ -209,6 +243,47 @@ public final class ClientRecordingManager implements CaptureBridge.ClientSink {
         }
     }
 
+    /**
+     * Called from the client Netty decoder before packet handling. The supplied
+     * frame already contains Minecraft's packet id followed by its payload.
+     */
+    public void inboundPacket(ProtocolInfo<?> protocol, Packet<?> packet, byte[] frame) {
+        ProtocolPhase phase = protocolPhase(protocol.id());
+        if (phase == null) {
+            return;
+        }
+        ClientSession current = session;
+        if (current == null) {
+            // RECORD_ON_JOIN controls automatic session creation. Once a local
+            // session was started manually, packet capture must remain active
+            // even if the menu toggle is later turned off.
+            if (!DreamingRecallClientConfig.RECORD_ON_JOIN.get()) {
+                return;
+            }
+            if (phase == ProtocolPhase.LOGIN && !(packet instanceof ClientboundGameProfilePacket)) {
+                return;
+            }
+            synchronized (this) {
+                if (session == null) {
+                    start(Minecraft.getInstance(), false);
+                }
+                current = session;
+            }
+        }
+        if (current != null) {
+            current.inboundPacket(phase, packet, frame);
+        }
+    }
+
+    private static ProtocolPhase protocolPhase(ConnectionProtocol protocol) {
+        return switch (protocol) {
+            case LOGIN -> ProtocolPhase.LOGIN;
+            case CONFIGURATION -> ProtocolPhase.CONFIGURATION;
+            case PLAY -> ProtocolPhase.PLAY;
+            default -> null;
+        };
+    }
+
     private static final class ClientSession {
         private static final int CHUNKS_PER_TICK = 1;
         private static final int ENTITIES_PER_TICK = 128;
@@ -223,7 +298,9 @@ public final class ClientRecordingManager implements CaptureBridge.ClientSink {
 
         private ClientLevel level;
         private String dimensionId = "";
-        private long tick;
+        private volatile long tick;
+        private volatile String packetDimensionId = "";
+        private boolean registryManifestScheduled;
         private int entityCursor;
         private boolean baselineRunning;
         private boolean baselineBeginAccepted;
@@ -275,7 +352,65 @@ public final class ClientRecordingManager implements CaptureBridge.ClientSink {
         private void switchLevel(Minecraft minecraft, ClientLevel next, String reason) {
             level = next;
             dimensionId = next.dimension().location().toString();
+            packetDimensionId = dimensionId;
+            scheduleRegistryManifest(next);
             beginBaseline(minecraft, reason, -1);
+        }
+
+        private void scheduleRegistryManifest(ClientLevel currentLevel) {
+            if (registryManifestScheduled) {
+                return;
+            }
+            registryManifestScheduled = true;
+            var manifest = RuntimeRegistryManifest.capture(currentLevel.registryAccess());
+            pipeline.readyFuture().thenAcceptAsync(directory -> {
+                try {
+                    RegistryManifestCodec.write(directory, manifest);
+                } catch (java.io.IOException failure) {
+                    throw new CompletionException(failure);
+                }
+            }, command -> Thread.startVirtualThread(command)).exceptionally(failure -> {
+                DreamingRecall.LOGGER.warn("Could not write replay registry manifest", failure);
+                return null;
+            });
+        }
+
+        private void inboundPacket(ProtocolPhase phase, Packet<?> packet, byte[] frame) {
+            try {
+                String packetId = packet.type().id().toString();
+                String namespace = packet instanceof ClientboundCustomPayloadPacket custom
+                        ? custom.payload().type().id().getNamespace()
+                        : packet.type().id().getNamespace();
+                UUID playerId = Minecraft.getInstance().getUser().getProfileId();
+                String track = phase == ProtocolPhase.PLAY
+                        ? TrackNames.playerClient(playerId)
+                        : TrackNames.CONFIGURATION;
+                PacketEnvelope envelope = new PacketEnvelope(
+                        PacketEnvelope.CURRENT_SCHEMA_VERSION,
+                        track,
+                        phase,
+                        packetId,
+                        namespace,
+                        phase == ProtocolPhase.PLAY ? PacketScope.CLIENT_LOCAL : PacketScope.SESSION,
+                        phase == ProtocolPhase.PLAY ? packetDimensionId : "",
+                        phase == ProtocolPhase.PLAY ? playerId : null,
+                        null,
+                        "",
+                        frame
+                );
+                offerCore(
+                        CoreRecordType.PACKET_FRAME,
+                        envelope.dimensionId(),
+                        PacketEnvelopeCodec.encode(envelope),
+                        archiveNanos()
+                );
+            } catch (Throwable failure) {
+                DreamingRecall.LOGGER.warn(
+                        "Could not capture clientbound replay packet {}",
+                        packet.type().id(),
+                        failure
+                );
+            }
         }
 
         private void beginBaseline(Minecraft minecraft, String reason, long generation) {

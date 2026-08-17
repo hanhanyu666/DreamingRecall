@@ -10,12 +10,14 @@
     "ServerCommonPacketListenerMixin"
   ],
   "client": [
+    "ClientPacketDecoderMixin",
     "ClientPacketListenerAccessor",
     "ClientPacketListenerMixin",
     "EntityAccessor",
     "ItemInHandRendererMixin",
     "LivingEntityAccessor",
     "MinecraftAccessor",
+    "MinecraftReplayScreenMixin",
     "ClientLevelMixin",
     "WalkAnimationStateAccessor"
   ],

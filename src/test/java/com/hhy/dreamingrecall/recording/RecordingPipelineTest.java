@@ -1,6 +1,7 @@
 package com.hhy.dreamingrecall.recording;
 
 import com.hhy.dreamingrecall.archive.ArchiveManifest;
+import com.hhy.dreamingrecall.archive.ArchiveInspector;
 import com.hhy.dreamingrecall.archive.ArchiveScanResult;
 import com.hhy.dreamingrecall.archive.ArchiveScanner;
 import com.hhy.dreamingrecall.archive.ContentReferenceCodec;
@@ -66,6 +67,40 @@ class RecordingPipelineTest {
         assertEquals(CoreRecordType.SESSION_START.id(), records.getFirst().typeId());
         assertEquals(CoreRecordType.SESSION_END.id(), records.getLast().typeId());
         assertTrue(scan.diagnostics().isEmpty());
+    }
+
+    @Test
+    void normalizesOutOfOrderTimestampsBeforeCommit() throws Exception {
+        RecordingPipeline pipeline = pipeline(RecordingSettings.defaults());
+        pipeline.start();
+        pipeline.readyFuture().get(5, TimeUnit.SECONDS);
+
+        assertEquals(OfferResult.ACCEPTED, pipeline.offer(ReplayRecord.core(
+                CoreRecordType.SERVER_TICK, 100, 1, "", new byte[0]
+        )));
+        assertEquals(OfferResult.ACCEPTED, pipeline.offer(ReplayRecord.core(
+                CoreRecordType.SERVER_TICK, 10, 2, "", new byte[0]
+        )));
+        assertEquals(OfferResult.ACCEPTED, pipeline.offer(ReplayRecord.core(
+                CoreRecordType.SERVER_TICK, 50, 3, "", new byte[0]
+        )));
+
+        pipeline.requestStop(20, 4);
+        Path archive = pipeline.stoppedFuture().get(10, TimeUnit.SECONDS);
+
+        assertTrue(ArchiveInspector.inspect(archive).isHealthy());
+        List<Long> times = ArchiveScanner.scan(archive, true).index().segments().stream()
+                .flatMap(segment -> {
+                    try {
+                        return SegmentCodec.read(segment.path()).records().stream();
+                    } catch (Exception failure) {
+                        throw new AssertionError(failure);
+                    }
+                })
+                .map(ReplayRecord::archiveNanos)
+                .toList();
+        assertTrue(times.stream().sorted().toList().equals(times));
+        assertTrue(times.getLast() >= 100);
     }
 
     @Test
