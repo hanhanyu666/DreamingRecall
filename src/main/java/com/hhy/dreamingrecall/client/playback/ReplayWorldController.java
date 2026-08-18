@@ -281,14 +281,18 @@ public final class ReplayWorldController implements ReplayViewController {
             return;
         }
         double speed = (fast ? 40.0 : 7.0) * Math.max(0.0, Math.min(0.25, elapsedSeconds));
-        double yaw = Math.toRadians(freeCamera.yaw());
-        double x = (-Math.sin(yaw) * forward + Math.cos(yaw) * strafe) * speed;
-        double z = (Math.cos(yaw) * forward + Math.sin(yaw) * strafe) * speed;
+        FreeCameraMotion.Delta delta = FreeCameraMotion.horizontalDelta(
+                minecraft.gameRenderer.getMainCamera(),
+                freeCamera.yaw(),
+                forward,
+                strafe,
+                speed
+        );
         freeCamera = new CameraPose(
                 activeDimension,
-                freeCamera.x() + x,
+                freeCamera.x() + delta.x(),
                 freeCamera.y() + vertical * speed,
-                freeCamera.z() + z,
+                freeCamera.z() + delta.z(),
                 freeCamera.yaw(),
                 freeCamera.pitch(),
                 freeCamera.roll(),

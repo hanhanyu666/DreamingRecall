@@ -36,7 +36,9 @@ import org.lwjgl.glfw.GLFW;
 
 import java.util.Locale;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.UUID;
@@ -98,6 +100,7 @@ public final class ReplayTimelineScreen extends Screen {
     private ReplayWorldController.CameraMode desiredCameraMode = ReplayWorldController.CameraMode.FREE;
     private final java.util.LinkedHashMap<UUID, ReplayWorldController.PlayerTarget> knownPlayers =
             new java.util.LinkedHashMap<>();
+    private final Set<Integer> freeCameraPressedKeys = new HashSet<>();
 
     public ReplayTimelineScreen(Screen parent, ClientArchiveEntry archive) {
         super(Component.translatable("screen.dreamingrecall.timeline.title"));
@@ -315,6 +318,7 @@ public final class ReplayTimelineScreen extends Screen {
             }
             if (worldController.cameraMode() == ReplayWorldController.CameraMode.FREE
                     && isFreeCameraControlKey(keyCode, scanCode)) {
+                freeCameraPressedKeys.add(keyCode);
                 return true;
             }
         }
@@ -349,6 +353,16 @@ public final class ReplayTimelineScreen extends Screen {
         return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
+    @Override
+    public boolean keyReleased(int keyCode, int scanCode, int modifiers) {
+        if (worldController != null
+                && worldController.cameraMode() == ReplayWorldController.CameraMode.FREE
+                && isFreeCameraControlKey(keyCode, scanCode)) {
+            return true;
+        }
+        return super.keyReleased(keyCode, scanCode, modifiers);
+    }
+
     private boolean isFreeCameraControlKey(int keyCode, int scanCode) {
         return minecraft.options.keyUp.matches(keyCode, scanCode)
                 || minecraft.options.keyDown.matches(keyCode, scanCode)
@@ -362,6 +376,7 @@ public final class ReplayTimelineScreen extends Screen {
     @Override
     public void removed() {
         closed = true;
+        freeCameraPressedKeys.clear();
         if (packetController != null) {
             packetController.close();
             packetController = null;
@@ -1350,23 +1365,34 @@ public final class ReplayTimelineScreen extends Screen {
 
     private void updateFreeCameraFromKeys(double elapsedSeconds) {
         if (worldController == null || worldController.cameraMode() != ReplayWorldController.CameraMode.FREE) {
+            freeCameraPressedKeys.clear();
             return;
         }
-        double forward = (isPhysicallyDown(minecraft.options.keyUp) ? 1.0 : 0.0)
-                - (isPhysicallyDown(minecraft.options.keyDown) ? 1.0 : 0.0);
-        double strafe = (isPhysicallyDown(minecraft.options.keyLeft) ? 1.0 : 0.0)
-                - (isPhysicallyDown(minecraft.options.keyRight) ? 1.0 : 0.0);
-        double vertical = (isPhysicallyDown(minecraft.options.keyJump) ? 1.0 : 0.0)
-                - (isPhysicallyDown(minecraft.options.keyShift) ? 1.0 : 0.0);
-        if (forward != 0.0 || strafe != 0.0 || vertical != 0.0) {
-            worldController.moveFreeCamera(
-                    forward,
-                    strafe,
-                    vertical,
-                    isPhysicallyDown(minecraft.options.keySprint),
-                    elapsedSeconds
-            );
+        try {
+            double forward = (isCameraKeyDown(minecraft.options.keyUp) ? 1.0 : 0.0)
+                    - (isCameraKeyDown(minecraft.options.keyDown) ? 1.0 : 0.0);
+            double strafe = (isCameraKeyDown(minecraft.options.keyLeft) ? 1.0 : 0.0)
+                    - (isCameraKeyDown(minecraft.options.keyRight) ? 1.0 : 0.0);
+            double vertical = (isCameraKeyDown(minecraft.options.keyJump) ? 1.0 : 0.0)
+                    - (isCameraKeyDown(minecraft.options.keyShift) ? 1.0 : 0.0);
+            if (forward != 0.0 || strafe != 0.0 || vertical != 0.0) {
+                worldController.moveFreeCamera(
+                        forward,
+                        strafe,
+                        vertical,
+                        isCameraKeyDown(minecraft.options.keySprint),
+                        elapsedSeconds
+                );
+            }
+        } finally {
+            // Physical polling handles held keys; event pulses last one tick.
+            freeCameraPressedKeys.clear();
         }
+    }
+
+    private boolean isCameraKeyDown(KeyMapping mapping) {
+        InputConstants.Key key = mapping.getKey();
+        return isPhysicallyDown(mapping) || freeCameraPressedKeys.contains(key.getValue());
     }
 
     private boolean isPhysicallyDown(KeyMapping mapping) {
