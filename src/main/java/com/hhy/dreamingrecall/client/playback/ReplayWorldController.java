@@ -996,9 +996,7 @@ public final class ReplayWorldController implements ReplayViewController {
                     freeCamera.y() - cameraPlayer.getEyeHeight(),
                     freeCamera.z()
             );
-            cameraPlayer.setYRot(freeCamera.yaw());
-            cameraPlayer.setXRot(freeCamera.pitch());
-            cameraPlayer.setOldPosAndRot();
+            ReplayCameraEntityState.applyRotation(cameraPlayer, freeCamera.yaw(), freeCamera.pitch());
             minecraft.setCameraEntity(cameraPlayer);
             minecraft.options.setCameraType(CameraType.FIRST_PERSON);
             applyFov(freeCamera.fov());

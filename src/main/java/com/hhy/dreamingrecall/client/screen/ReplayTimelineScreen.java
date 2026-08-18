@@ -101,6 +101,13 @@ public final class ReplayTimelineScreen extends Screen {
     private final java.util.LinkedHashMap<UUID, ReplayWorldController.PlayerTarget> knownPlayers =
             new java.util.LinkedHashMap<>();
     private final Set<Integer> freeCameraPressedKeys = new HashSet<>();
+    private boolean freeCameraMouseLook;
+    private boolean resetFreeCameraMousePosition;
+    private double freeCameraMouseX;
+    private double freeCameraMouseY;
+    private double restoreCursorX;
+    private double restoreCursorY;
+    private int restoreCursorMode = GLFW.GLFW_CURSOR_NORMAL;
 
     public ReplayTimelineScreen(Screen parent, ClientArchiveEntry archive) {
         super(Component.translatable("screen.dreamingrecall.timeline.title"));
@@ -189,6 +196,10 @@ public final class ReplayTimelineScreen extends Screen {
     }
 
     private void updatePlaybackFrameClock() {
+        if (freeCameraMouseLook && (worldController == null
+                || worldController.cameraMode() != ReplayWorldController.CameraMode.FREE)) {
+            stopFreeCameraMouseLook();
+        }
         long now = System.nanoTime();
         if (lastTickNanos == 0) {
             lastTickNanos = now;
@@ -257,6 +268,9 @@ public final class ReplayTimelineScreen extends Screen {
 
     @Override
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (freeCameraMouseLook) {
+            return true;
+        }
         boolean handled = super.mouseReleased(mouseX, mouseY, button);
         if (button == 0 && draggingKeyframe) {
             endKeyframeDrag();
@@ -271,6 +285,9 @@ public final class ReplayTimelineScreen extends Screen {
 
     @Override
     public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (freeCameraMouseLook) {
+            return true;
+        }
         if (button == 0 && draggingKeyframe) {
             dragSelectedKeyframe(mouseX);
             return true;
@@ -285,7 +302,36 @@ public final class ReplayTimelineScreen extends Screen {
     }
 
     @Override
+    public void mouseMoved(double mouseX, double mouseY) {
+        if (!freeCameraMouseLook) {
+            super.mouseMoved(mouseX, mouseY);
+            return;
+        }
+        if (resetFreeCameraMousePosition) {
+            resetFreeCameraMousePosition = false;
+            freeCameraMouseX = mouseX;
+            freeCameraMouseY = mouseY;
+            return;
+        }
+        double deltaX = mouseX - freeCameraMouseX;
+        double deltaY = mouseY - freeCameraMouseY;
+        freeCameraMouseX = mouseX;
+        freeCameraMouseY = mouseY;
+        if (worldController != null
+                && worldController.cameraMode() == ReplayWorldController.CameraMode.FREE
+                && (deltaX != 0.0 || deltaY != 0.0)) {
+            worldController.turnFreeCamera(
+                    (float) (deltaX * cameraTurnScale()),
+                    (float) (deltaY * cameraTurnScale())
+            );
+        }
+    }
+
+    @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (freeCameraMouseLook) {
+            return true;
+        }
         if (hudVisible && button == 0 && beginKeyframeDrag(mouseX, mouseY)) {
             clearFocus();
             return true;
@@ -293,6 +339,12 @@ public final class ReplayTimelineScreen extends Screen {
         boolean handled = super.mouseClicked(mouseX, mouseY, button);
         if (!handled) {
             clearFocus();
+            if (button == 0 && worldController != null
+                    && worldController.cameraMode() == ReplayWorldController.CameraMode.FREE
+                    && !scrubbing) {
+                startFreeCameraMouseLook(mouseX, mouseY);
+                return true;
+            }
         }
         return handled;
     }
@@ -300,6 +352,10 @@ public final class ReplayTimelineScreen extends Screen {
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
         if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            if (freeCameraMouseLook) {
+                stopFreeCameraMouseLook();
+                return true;
+            }
             onClose();
             return true;
         }
@@ -310,6 +366,7 @@ public final class ReplayTimelineScreen extends Screen {
         if (worldController != null) {
             if (worldController.cameraMode() != ReplayWorldController.CameraMode.FREE
                     && minecraft.options.keyShift.matches(keyCode, scanCode)) {
+                disableDirectorForManualCamera();
                 worldController.setCameraMode(ReplayWorldController.CameraMode.FREE);
                 desiredAttachedPlayer = null;
                 desiredCameraMode = ReplayWorldController.CameraMode.FREE;
@@ -318,6 +375,7 @@ public final class ReplayTimelineScreen extends Screen {
             }
             if (worldController.cameraMode() == ReplayWorldController.CameraMode.FREE
                     && isFreeCameraControlKey(keyCode, scanCode)) {
+                disableDirectorForManualCamera();
                 freeCameraPressedKeys.add(keyCode);
                 return true;
             }
@@ -376,6 +434,7 @@ public final class ReplayTimelineScreen extends Screen {
     @Override
     public void removed() {
         closed = true;
+        stopFreeCameraMouseLook();
         freeCameraPressedKeys.clear();
         if (packetController != null) {
             packetController.close();
@@ -563,6 +622,9 @@ public final class ReplayTimelineScreen extends Screen {
         ReplayWorldController.CameraMode[] modes = ReplayWorldController.CameraMode.values();
         int next = (worldController.cameraMode().ordinal() + 1) % modes.length;
         worldController.setCameraMode(modes[next]);
+        if (worldController.cameraMode() != ReplayWorldController.CameraMode.FREE) {
+            stopFreeCameraMouseLook();
+        }
         desiredCameraMode = worldController.cameraMode();
         desiredAttachedPlayer = worldController.attachedPlayerTarget()
                 .map(ReplayWorldController.PlayerTarget::uuid)
@@ -1376,6 +1438,7 @@ public final class ReplayTimelineScreen extends Screen {
             double vertical = (isCameraKeyDown(minecraft.options.keyJump) ? 1.0 : 0.0)
                     - (isCameraKeyDown(minecraft.options.keyShift) ? 1.0 : 0.0);
             if (forward != 0.0 || strafe != 0.0 || vertical != 0.0) {
+                disableDirectorForManualCamera();
                 worldController.moveFreeCamera(
                         forward,
                         strafe,
@@ -1402,6 +1465,57 @@ public final class ReplayTimelineScreen extends Screen {
             return InputConstants.isKeyDown(minecraft.getWindow().getWindow(), key.getValue());
         }
         return mapping.isDown();
+    }
+
+    private void startFreeCameraMouseLook(double mouseX, double mouseY) {
+        if (freeCameraMouseLook || minecraft == null) {
+            return;
+        }
+        disableDirectorForManualCamera();
+        long window = minecraft.getWindow().getWindow();
+        double[] cursorX = new double[1];
+        double[] cursorY = new double[1];
+        GLFW.glfwGetCursorPos(window, cursorX, cursorY);
+        restoreCursorX = cursorX[0];
+        restoreCursorY = cursorY[0];
+        restoreCursorMode = GLFW.glfwGetInputMode(window, GLFW.GLFW_CURSOR);
+        freeCameraMouseLook = true;
+        resetFreeCameraMousePosition = true;
+        freeCameraMouseX = mouseX;
+        freeCameraMouseY = mouseY;
+        InputConstants.grabOrReleaseMouse(
+                window,
+                GLFW.GLFW_CURSOR_DISABLED,
+                minecraft.getWindow().getScreenWidth() / 2.0,
+                minecraft.getWindow().getScreenHeight() / 2.0
+        );
+    }
+
+    private void stopFreeCameraMouseLook() {
+        if (!freeCameraMouseLook || minecraft == null) {
+            return;
+        }
+        freeCameraMouseLook = false;
+        resetFreeCameraMousePosition = false;
+        InputConstants.grabOrReleaseMouse(
+                minecraft.getWindow().getWindow(),
+                restoreCursorMode,
+                restoreCursorX,
+                restoreCursorY
+        );
+    }
+
+    private double cameraTurnScale() {
+        double sensitivity = minecraft.options.sensitivity().get() * 0.6 + 0.2;
+        return sensitivity * sensitivity * sensitivity * 8.0 * 0.15;
+    }
+
+    private void disableDirectorForManualCamera() {
+        if (!directorMode) {
+            return;
+        }
+        directorMode = false;
+        updateButtons();
     }
 
     private String playerLabel() {

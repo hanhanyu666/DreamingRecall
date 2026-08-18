@@ -5,6 +5,7 @@ import com.hhy.dreamingrecall.client.playback.ReplayEntityFactory;
 import com.hhy.dreamingrecall.client.playback.ReplayWorldController;
 import com.hhy.dreamingrecall.client.playback.ReplayClock;
 import com.hhy.dreamingrecall.client.playback.FreeCameraMotion;
+import com.hhy.dreamingrecall.client.playback.ReplayCameraEntityState;
 import com.hhy.dreamingrecall.director.CameraPose;
 import com.hhy.dreamingrecall.playback.decode.DecodedPayload;
 import com.mojang.authlib.GameProfile;
@@ -347,9 +348,11 @@ public final class PacketReplayViewController implements ReplayViewController {
                     freeCamera.y() - freeCameraEntity.getEyeHeight(),
                     freeCamera.z()
             );
-            freeCameraEntity.setYRot(freeCamera.yaw());
-            freeCameraEntity.setXRot(freeCamera.pitch());
-            freeCameraEntity.setOldPosAndRot();
+            ReplayCameraEntityState.applyRotation(
+                    freeCameraEntity,
+                    freeCamera.yaw(),
+                    freeCamera.pitch()
+            );
             minecraft.setCameraEntity(freeCameraEntity);
             minecraft.options.setCameraType(CameraType.FIRST_PERSON);
             minecraft.options.fov().set(Mth.clamp(Math.round(freeCamera.fov()), 30, 110));
